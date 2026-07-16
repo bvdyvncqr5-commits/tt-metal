@@ -201,6 +201,23 @@ jobs:
             --out /work/power_report.json \
             -- bash -c '${{ matrix.test-group.cmd }}'
 
+      - name: Upload loss plot
+        id: upload-loss-plot
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: loss-plot-${{ matrix.test-group.name }}-${{ matrix.test-group.sku }}
+          path: /work/generated/tt-train-metrics/plots/*/losses.png
+          if-no-files-found: warn
+          retention-days: 30
+          archive: false
+
+      - name: Add loss plot to summary
+        if: ${{ !cancelled() && steps.upload-loss-plot.outputs.artifact-url != '' }}
+        run: |
+          cat /work/generated/tt-train-metrics/plots/*/losses.md >> $GITHUB_STEP_SUMMARY
+          echo "[Download full loss plot image](${{ steps.upload-loss-plot.outputs.artifact-url }})" >> $GITHUB_STEP_SUMMARY
+
       - name: Upload power report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
