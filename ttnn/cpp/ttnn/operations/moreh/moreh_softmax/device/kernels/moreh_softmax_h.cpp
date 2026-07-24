@@ -7,43 +7,46 @@
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "ttnn/kernel/compute/moreh_common.hpp"
 #include "api/dataflow/dataflow_buffer.h"
+#include "experimental/kernel_args.h"
 
 void kernel_main() {
-    constexpr auto cb_in0 = tt::CBIndex::c_0;
+    constexpr auto cb_in0 = dfb::in0;
     DataflowBuffer dfb_in0_obj(cb_in0);
-    constexpr auto cb_mask = tt::CBIndex::c_1;
+    constexpr auto cb_mask = dfb::mask;
     DataflowBuffer dfb_mask_obj(cb_mask);
-    constexpr auto cb_max_scaler = tt::CBIndex::c_2;
+    constexpr auto cb_max_scaler = dfb::max_scaler;
     DataflowBuffer dfb_max_scaler_obj(cb_max_scaler);
-    constexpr auto cb_sum_scaler = tt::CBIndex::c_3;
+    constexpr auto cb_sum_scaler = dfb::sum_scaler;
     DataflowBuffer dfb_sum_scaler_obj(cb_sum_scaler);
-    constexpr auto cb_out0 = tt::CBIndex::c_16;
+    constexpr auto cb_out0 = dfb::out0;
     DataflowBuffer dfb_out0_obj(cb_out0);
-    constexpr auto cb_exps = tt::CBIndex::c_24;
+    constexpr auto cb_exps = dfb::exps;
     DataflowBuffer dfb_exps_obj(cb_exps);
-    constexpr auto cb_recipsumexps = tt::CBIndex::c_25;
+    constexpr auto cb_recipsumexps = dfb::recip_sum_exps;
     DataflowBuffer dfb_recipsumexps_obj(cb_recipsumexps);
-    constexpr auto cb_max = tt::CBIndex::c_26;
+    constexpr auto cb_max = dfb::max;
     DataflowBuffer dfb_max_obj(cb_max);
-    constexpr auto cb_x_m_max = tt::CBIndex::c_27;
+    constexpr auto cb_x_m_max = dfb::x_minus_max;
     DataflowBuffer dfb_x_m_max_obj(cb_x_m_max);
-    constexpr auto cb_tmp = tt::CBIndex::c_28;
+    constexpr auto cb_tmp = dfb::tmp;
     DataflowBuffer dfb_tmp_obj(cb_tmp);
 
     constexpr int dst0 = 0;
     constexpr int dst1 = 1;
-    constexpr uint32_t onetile = 1;
+    constexpr std::uint32_t onetile = 1;
 
     binary_op_init_common(cb_in0, cb_max_scaler, cb_out0);
 
-    uint32_t N = get_compile_time_arg_val(0);
-    uint32_t Ht = get_compile_time_arg_val(1);
+    // Plain uint32_t (not constexpr) to match legacy get_compile_time_arg_val typing and avoid
+    // force-unrolling the per-Ht loops (see moreh_softmax_w_large.cpp for the LTO/addrmod rationale).
+    std::uint32_t N = get_arg(args::N);
+    std::uint32_t Ht = get_arg(args::Ht);
 
     dfb_mask_obj.wait_front(onetile);
     dfb_max_scaler_obj.wait_front(onetile);
     dfb_sum_scaler_obj.wait_front(onetile);
 
-    for (uint32_t n = 0; n < N; ++n) {
+    for (std::uint32_t n = 0; n < N; ++n) {
         // find max value
         if (Ht == 1) {
             mask_tile_to_cb(dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, 0, 0, /*pop0=*/0, /*popm=*/0);
@@ -72,7 +75,7 @@ void kernel_main() {
         dfb_in0_obj.wait_front(Ht);
         dfb_max_obj.wait_front(1);
 
-        for (uint32_t h = 0; h < Ht; ++h) {
+        for (std::uint32_t h = 0; h < Ht; ++h) {
             tile_regs_acquire();
             sub_bcast_rows_init_short_with_dt(dfb_in0_obj, dfb_max_obj);
             sub_tiles_bcast<BroadcastType::ROW>(cb_in0, cb_max, h, 0, dst0);
@@ -89,7 +92,7 @@ void kernel_main() {
         // compute exp(x - max(x))
         dfb_exps_obj.reserve_back(Ht);
         dfb_x_m_max_obj.wait_front(Ht);
-        for (uint32_t h = 0; h < Ht; ++h) {
+        for (std::uint32_t h = 0; h < Ht; ++h) {
             tile_regs_acquire();
             copy_tile_init_with_dt(dfb_x_m_max_obj);
             copy_tile(cb_x_m_max, h, dst0);
@@ -129,7 +132,7 @@ void kernel_main() {
             compute_kernel_lib::ReduceInputBlockShape::col(Ht),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::NoAccumulation{},
-            [](uint32_t dst_idx) {
+            [](std::uint32_t dst_idx) {
                 log_tile_init();
                 log_tile(dst_idx);
             });
@@ -145,7 +148,7 @@ void kernel_main() {
             compute_kernel_lib::ReduceInputBlockShape::col(Ht),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::NoAccumulation{},
-            [](uint32_t dst_idx) {
+            [](std::uint32_t dst_idx) {
                 recip_tile_init();
                 recip_tile(dst_idx);
             });
@@ -159,7 +162,7 @@ void kernel_main() {
         dfb_exps_obj.wait_front(Ht);
 #endif
 
-        for (uint32_t h = 0; h < Ht; h += onetile) {
+        for (std::uint32_t h = 0; h < Ht; h += onetile) {
 #ifdef LOG
             // x - max - log(sum)
             tile_regs_acquire();

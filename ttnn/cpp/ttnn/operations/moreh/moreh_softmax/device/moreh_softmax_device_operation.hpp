@@ -8,6 +8,8 @@
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/types.hpp"
 #include <tt-metalium/program_descriptors.hpp>
+#include <ttnn/metal_v2_artifacts.hpp>
+#include <cstdint>
 
 namespace ttnn::operations::moreh::moreh_softmax {
 
@@ -31,7 +33,7 @@ bool is_moreh_softmax_h_small_available(const Tensor& tensor, const DeviceComput
 
 struct MorehSoftmaxOperation {
     struct operation_attributes_t {
-        uint32_t dim{};
+        std::uint32_t dim{};
         const MorehSoftmaxOp op;
         const MorehSoftmaxOpParallelizationStrategy strategy;
         const MemoryConfig memory_config;
@@ -46,20 +48,33 @@ struct MorehSoftmaxOperation {
     using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
-#define DEFINE_SOFTMAX_FACTORY(factory_name)                      \
-    struct factory_name {                                         \
-        static tt::tt_metal::ProgramDescriptor create_descriptor( \
-            const operation_attributes_t& operation_attributes,   \
-            const tensor_args_t& tensor_args,                     \
-            tensor_return_value_t& output);                       \
+// Ported to Metal 2.0 (MetalV2FactoryConcept); each returns ProgramArtifacts from
+// create_program_artifacts. See device/softmax_*/softmax_*.cpp.
+// NOTE: MorehSoftmaxWLargeFactory is NOT ported — it stays on the legacy `descriptor` concept.
+// The Metal 2.0 port of its compute kernel (moreh_softmax_w_large.cpp) triggers an LLK addrmod
+// "impossible constraint in 'asm'" JIT failure in the fp32_dest_acc_en path (out-of-scope LLK
+// code the porter must not modify). See METAL2_PORT_REPORT.md → Handoff points.
+#define DEFINE_SOFTMAX_FACTORY(factory_name)                                      \
+    struct factory_name {                                                         \
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts( \
+            const operation_attributes_t& operation_attributes,                   \
+            const tensor_args_t& tensor_args,                                     \
+            tensor_return_value_t& output);                                       \
     };
 
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxCLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHSmallFactory)
-    DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWSmallFactory)
 #undef DEFINE_SOFTMAX_FACTORY
+
+    // Not ported (see note above) — legacy descriptor factory.
+    struct MorehSoftmaxWLargeFactory {
+        static tt::tt_metal::ProgramDescriptor create_descriptor(
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& output);
+    };
 
     using program_factory_t = std::variant<
         MorehSoftmaxCLargeFactory,
@@ -82,7 +97,7 @@ struct MorehSoftmaxOperation {
 namespace ttnn::prim {
 ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOperation::tensor_return_value_t moreh_softmax(
     const Tensor& input_tensor,
-    uint32_t dim,
+    std::uint32_t dim,
     const std::optional<Tensor>& output_tensor,
     ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOp op,
     ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOpParallelizationStrategy strategy,
