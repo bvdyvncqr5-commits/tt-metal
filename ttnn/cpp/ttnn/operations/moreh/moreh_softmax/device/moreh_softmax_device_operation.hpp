@@ -48,12 +48,11 @@ struct MorehSoftmaxOperation {
     using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
-// Ported to Metal 2.0 (MetalV2FactoryConcept); each returns ProgramArtifacts from
-// create_program_artifacts. See device/softmax_*/softmax_*.cpp.
-// NOTE: MorehSoftmaxWLargeFactory is NOT ported — it stays on the legacy `descriptor` concept.
-// The Metal 2.0 port of its compute kernel (moreh_softmax_w_large.cpp) triggers an LLK addrmod
-// "impossible constraint in 'asm'" JIT failure in the fp32_dest_acc_en path (out-of-scope LLK
-// code the porter must not modify). See METAL2_PORT_REPORT.md → Handoff points.
+// All five factories ported to Metal 2.0 (MetalV2FactoryConcept); each returns ProgramArtifacts
+// from create_program_artifacts. See device/softmax_*/softmax_*.cpp.
+// NOTE (w_large): the Metal 2.0 port of moreh_softmax_w_large.cpp triggers an LLK addrmod
+// "impossible constraint in 'asm'" JIT failure in the fp32_dest_acc_en path (out-of-scope LLK).
+// This commit is reverted immediately; see METAL2_PORT_REPORT.md → Handoff points.
 #define DEFINE_SOFTMAX_FACTORY(factory_name)                                      \
     struct factory_name {                                                         \
         static ttnn::device_operation::ProgramArtifacts create_program_artifacts( \
@@ -65,16 +64,9 @@ struct MorehSoftmaxOperation {
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxCLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxHSmallFactory)
+    DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWLargeFactory)
     DEFINE_SOFTMAX_FACTORY(MorehSoftmaxWSmallFactory)
 #undef DEFINE_SOFTMAX_FACTORY
-
-    // Not ported (see note above) — legacy descriptor factory.
-    struct MorehSoftmaxWLargeFactory {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
-            const operation_attributes_t& operation_attributes,
-            const tensor_args_t& tensor_args,
-            tensor_return_value_t& output);
-    };
 
     using program_factory_t = std::variant<
         MorehSoftmaxCLargeFactory,

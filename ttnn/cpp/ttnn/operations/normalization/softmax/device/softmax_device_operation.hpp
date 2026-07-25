@@ -29,11 +29,12 @@ struct SoftmaxDeviceOperation {
         static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
     };
-    // NOT ported — legacy descriptor factory. The Metal 2.0 port of the shared w_large compute kernel
-    // (moreh_softmax_w_large.cpp) triggers an LLK addrmod "impossible constraint in 'asm'" JIT failure
-    // in the fp32 path (out-of-scope LLK). See METAL2_PORT_REPORT.md → Open items.
+    // Ported to Metal 2.0 (MetalV2FactoryConcept). See device/softmax_program_factory_general_w_large.cpp.
+    // NOTE: the shared w_large compute kernel fails to JIT-compile in the fp32 path (LLK addrmod
+    // "impossible constraint in 'asm'", out-of-scope). This commit is reverted immediately; see
+    // METAL2_PORT_REPORT.md.
     struct SoftmaxProgramFactoryGeneralWLarge {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
     };
     // Ported to Metal 2.0 (MetalV2FactoryConcept). See device/softmax_program_factory_general_h_small.cpp.

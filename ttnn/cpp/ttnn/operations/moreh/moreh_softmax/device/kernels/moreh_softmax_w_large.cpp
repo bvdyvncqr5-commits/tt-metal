@@ -2,40 +2,50 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+// KNOWN ISSUE: this Metal 2.0 port of the w_large compute kernel fails to JIT-compile when
+// fp32_dest_acc_en=True — the LLK addrmod set() hits "impossible constraint in 'asm'"
+// (ckernel_addrmod.h:143) inlined from reduce_init via reduce_helpers_compute.inl, at the
+// phase-1 compute_kernel_lib::reduce<MAX, REDUCE_ROW, ...> below. The larger fp32 TU tips the
+// compiler past constant-folding the addrmod section index. Legacy compiles the same case, so
+// this is a port regression rooted in out-of-scope LLK/kernel-lib code. This unit is committed
+// then reverted; do not enable it until the LLK cliff is fixed. See METAL2_PORT_REPORT.md.
+
 #include <cstdint>
 
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "ttnn/kernel/compute/moreh_common.hpp"
 #include "api/dataflow/dataflow_buffer.h"
+#include "experimental/kernel_args.h"
 
 void kernel_main() {
-    constexpr auto cb_in0 = tt::CBIndex::c_0;
+    constexpr auto cb_in0 = dfb::in0;
     DataflowBuffer dfb_in0_obj(cb_in0);
-    constexpr auto cb_mask = tt::CBIndex::c_1;
+    constexpr auto cb_mask = dfb::mask;
     DataflowBuffer dfb_mask_obj(cb_mask);
-    constexpr auto cb_max_scaler = tt::CBIndex::c_2;
-    constexpr auto cb_sum_scaler = tt::CBIndex::c_3;
-    constexpr auto cb_out0 = tt::CBIndex::c_16;
+    constexpr auto cb_max_scaler = dfb::max_scaler;
+    constexpr auto cb_sum_scaler = dfb::sum_scaler;
+    constexpr auto cb_out0 = dfb::out0;
     DataflowBuffer dfb_out0_obj(cb_out0);
-    constexpr auto cb_exps = tt::CBIndex::c_24;
+    constexpr auto cb_exps = dfb::exps;
     DataflowBuffer dfb_exps_obj(cb_exps);
-    constexpr auto cb_recipsumexps = tt::CBIndex::c_25;
+    constexpr auto cb_recipsumexps = dfb::recip_sum_exps;
     DataflowBuffer dfb_recipsumexps_obj(cb_recipsumexps);
-    constexpr auto cb_add = tt::CBIndex::c_26;
+    constexpr auto cb_add = dfb::add;
     DataflowBuffer dfb_add_obj(cb_add);
-    constexpr auto cb_max = tt::CBIndex::c_27;
+    constexpr auto cb_max = dfb::max;
     DataflowBuffer dfb_max_obj(cb_max);
-    constexpr auto cb_tmp = tt::CBIndex::c_28;
+    constexpr auto cb_tmp = dfb::tmp;
     DataflowBuffer dfb_tmp_obj(cb_tmp);
 
     binary_op_init_common(cb_in0, cb_max_scaler, cb_out0);
 
-    constexpr uint32_t onetile = 1;
+    constexpr std::uint32_t onetile = 1;
 
-    uint32_t N = get_compile_time_arg_val(0);
-    uint32_t Wt = get_compile_time_arg_val(1);
+    // Plain uint32_t (not constexpr) to match legacy get_compile_time_arg_val typing.
+    std::uint32_t N = get_arg(args::N);
+    std::uint32_t Wt = get_arg(args::Wt);
 
-    for (uint32_t n = 0; n < N; ++n) {
+    for (std::uint32_t n = 0; n < N; ++n) {
         // find max
         if (Wt == 1) {
             mask_tile_to_cb(dfb_in0_obj, dfb_mask_obj, dfb_tmp_obj, 0, 0, /*pop0=*/1, /*popm=*/0);
@@ -56,7 +66,7 @@ void kernel_main() {
         }
 
         // step 1
-        for (uint32_t w = 0; w < Wt; ++w) {
+        for (std::uint32_t w = 0; w < Wt; ++w) {
             // compute exp(x)
             if (w == Wt - 1) {
 #ifdef SOFTMAX
@@ -111,7 +121,7 @@ void kernel_main() {
             compute_kernel_lib::ReduceInputBlockShape::single(),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::NoAccumulation{},
-            [](uint32_t dst_idx) {
+            [](std::uint32_t dst_idx) {
                 log_tile_init();
                 log_tile(dst_idx);
             });
@@ -127,14 +137,14 @@ void kernel_main() {
             compute_kernel_lib::ReduceInputBlockShape::single(),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::NoAccumulation{},
-            [](uint32_t dst_idx) {
+            [](std::uint32_t dst_idx) {
                 recip_tile_init();
                 recip_tile(dst_idx);
             });
 #endif
 
         // step 3, compute final result
-        for (uint32_t w = 0; w < Wt; w += onetile) {
+        for (std::uint32_t w = 0; w < Wt; w += onetile) {
 #ifdef LOG
 #ifdef SOFTMAX
             // x - max - log(sum)
