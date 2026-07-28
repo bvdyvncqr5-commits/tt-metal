@@ -2,10 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-// KNOWN ISSUE — committed then reverted: the Metal 2.0 port of this factory's compute kernel
-// (moreh_softmax_w_large.cpp) fails to JIT-compile in the fp32_dest_acc_en path (out-of-scope LLK
-// addrmod "impossible constraint in 'asm'"). See METAL2_PORT_REPORT.md. Kept in git history so the
-// port work is recoverable once the LLK cliff is fixed.
+// NOTE: this factory's compute kernel (moreh_softmax_w_large.cpp) once failed to JIT-compile in the
+// fp32_dest_acc_en path (LLK addrmod "impossible constraint in 'asm'"). It is worked around by a noinline
+// split in that kernel — see its top-of-file WORKAROUND note and METAL2_PORT_REPORT.md. The proper fix is
+// upstream in the LLK (make the addrmod value a compile-time constant).
 
 #include "ttnn/operations/moreh/moreh_softmax/device/moreh_softmax_device_operation.hpp"
 #include "ttnn/operations/moreh/moreh_helper_functions.hpp"

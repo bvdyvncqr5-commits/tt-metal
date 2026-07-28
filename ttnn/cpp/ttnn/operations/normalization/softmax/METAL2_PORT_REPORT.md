@@ -2,17 +2,17 @@
 
 ## Outcome
 
-**PORTED (4 of 7 factories) + 1 CAPITULATED + 2 remaining.** Four **General** factories
-(`SoftmaxProgramFactoryGeneral{WSmall,HSmall,HLarge,CLarge}`) are converted to `MetalV2FactoryConcept`
+**PORTED (5 of 7 factories) + 2 remaining.** Five **General** factories
+(`SoftmaxProgramFactoryGeneral{WSmall,HSmall,HLarge,CLarge,WLarge}`) are converted to `MetalV2FactoryConcept`
 (`create_program_artifacts`), co-ported with `moreh/moreh_softmax` as the shared-kernel port-together set
 (issue #51081), and pass on device.
 
-`SoftmaxProgramFactoryGeneralWLarge` is **CAPITULATED** and reverted to the legacy `descriptor` concept: it
-borrows the shared `moreh_softmax_w_large.cpp` compute kernel, whose faithful Metal 2.0 port triggers an
-out-of-scope **LLK addrmod `impossible constraint in 'asm'` JIT failure in the `fp32_dest_acc_en` path**
-(confirmed a port regression — legacy compiles the same test). The w_large kernels + both co-borrowing
-factories were reverted in lockstep. Full detail in `moreh/moreh_softmax/METAL2_PORT_REPORT.md` →
-Handoff points; owner is the LLK / kernel-lib team.
+`SoftmaxProgramFactoryGeneralWLarge` borrows the shared `moreh_softmax_w_large.cpp` compute kernel, whose
+faithful Metal 2.0 port initially triggered an out-of-scope **LLK addrmod `impossible constraint in 'asm'`
+JIT failure in the `fp32_dest_acc_en` path** (confirmed a port regression — legacy compiles the same test).
+It is now **worked around** by a `noinline` split in that shared kernel (behavior-preserving stopgap; the
+proper fix is upstream in the LLK). Full detail in `moreh/moreh_softmax/METAL2_PORT_REPORT.md` →
+Handoff points; owner of the durable fix is the LLK team.
 
 The two **Attention** factories
 (`SoftmaxProgramFactoryAttentionOptimized` interleaved, `SoftmaxShardedProgramFactoryAttentionOptimized`
@@ -106,7 +106,7 @@ no op-owned tensors). Attention factories unchanged (`create_descriptor`).
 - **Build:** `./build_metal.sh --build-tests` → SUCCESS (exit 0, no errors, `AllFactoriesValid` satisfied).
 - **Device tests:** `scripts/run_safe_pytest.sh --run-all tests/ttnn/unit_tests/operations/fused/test_softmax.py`
   → **373 passed, 1 skipped, 0 failed** (covers the ported General path — 3D/5D/multi-dim softmax — plus the
-  untouched attention path; no JIT failures). The moreh nightly test (which shares the ported kernels)
-  is fully green (93 passed). The single w_large+fp32 failure surfaced only in the moreh nightly test that
-  exercises that exact combo; it drove the w_large capitulation above and does not appear here (the fused
-  suite does not exercise General w_large + fp32).
+  untouched attention path; no JIT failures). The moreh nightly test (which shares the ported kernels,
+  including w_large with the `noinline` workaround) is fully green (93 passed). The w_large+fp32 JIT failure
+  surfaced only in that moreh nightly test — the fused suite here does not exercise General w_large + fp32 —
+  and is now resolved by the shared-kernel workaround described above.
