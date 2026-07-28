@@ -12,7 +12,7 @@ Each `ProgramFactory` (+ the kernel entry points it binds) is one atomic port un
 |---|---|---|---|---|
 | 1-5 | **General W-small/W-large/H-small/H-large/C-large** | `SoftmaxProgramFactoryGeneral{WSmall,WLarge,HSmall,HLarge,CLarge}` | borrowed from `moreh/moreh_softmax/device/kernels/` (one trio each) | **co-port with `moreh/moreh_softmax`** (issue #51081) — shared kernel rewrite must land in both ops at once |
 | 6 | **Attention interleaved** — **PORTED (device-verified)** | `SoftmaxProgramFactoryAttentionOptimized` | own `device/kernels/attention/` (2 readers + 1 writer + 2 compute, runtime source selection small/large) | independent |
-| 7 | **Attention sharded** — remaining (next pass) | `SoftmaxShardedProgramFactoryAttentionOptimized` | own `device/kernels/attention/` (3 readers + 1 compute, no writer) | independent |
+| 7 | **Attention sharded** — **PORTED (device-verified)** | `SoftmaxShardedProgramFactoryAttentionOptimized` | own `device/kernels/attention/` (3 readers + 1 compute, no writer) | independent |
 
 The five General units share their kernel trios with `moreh/moreh_softmax` — see
 `ttnn/cpp/ttnn/operations/moreh/moreh_softmax/METAL2_PORT_PLAN.md` for the shared kernel
@@ -50,8 +50,8 @@ Compute RTA: `{NCHt, Ht, Wt, ndst, start_ht, mask_padded_data, cb_length}` — `
 
 **Resolution (unit 6, as built):** c_5 (pad-mask) is bound **unconditionally** (writer PRODUCER / compute CONSUMER, allocated always), with push/wait/pop runtime-gated on the `mask_padded_data` RTA — kept in the writer + large compute for byte-identical runtime. `mask_padded_data` was promoted to a `MASK_PADDED_DATA` `#define` **only on the small compute**, and only to `#ifdef`-gate the c_10 `cb_x` reference (which the small kernel would otherwise emit unconditionally under NUMERIC_STABLE even when c_10 isn't allocated). `cb_x` no-mask path aliases `cb_exps` (Same-FIFO aliasing); NUMERIC_STABLE path uses c_10. **Also required:** `#ifdef FUSED_SCALE_MASK`-gate the file-scope `dfb::` aliases of the fused CBs (c_3/c_4/c_9) in both compute kernels — an ungated alias fails to JIT on the non-fused path (caught on device). See report → Open items for the full decision log + a latent unconditional-c_5-pop observation in `softmax_large_tensor.cpp`.
 
-### Attention sharded (unit 7) — inventory to complete when unit is reached
-Borrowed-memory DFBs (c_0 input, c_11 output, c_3 sharded-mask via `.buffer=`), interleaved-mask Case-1. Readers: `reader_unary_sharded_sm.cpp` / `..._causal_mask_hw_dims.cpp` / `..._rm_mask.cpp` (runtime selection); compute `softmax_sharded.cpp`; no writer.
+### Attention sharded (unit 7) — PORTED (device-verified)
+Borrowed-memory DFBs (`borrowed_from`): c_0 input ← SRC (compute self-loop), c_11 output ← DST (compute self-loop), c_3 ← MASK when `SHARDED_CAUSAL_MASK` (compute self-loop); interleaved/rm/hw-dims mask → c_3 reader-produced 1P+1C (Case-1 mask tensor binding). Readers: `reader_unary_sharded_sm.cpp` / `..._causal_mask_hw_dims.cpp` / `..._rm_mask.cpp` (runtime selection by mask layout / hw-dims); compute `softmax_sharded.cpp`; no writer. Resolution notes: the reader's mask-read + c_3 binding are `#ifndef SHARDED_CAUSAL_MASK`-gated to match the borrowed c_3; `out0` (self-loop, no writer) needs its own fp32 `unpack_modes` entry (caught on device, `test_softmax_sd`). See report → Open items.
 
 ### Semaphores
 none (whole op).

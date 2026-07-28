@@ -56,8 +56,9 @@ struct SoftmaxDeviceOperation {
     // Optimized for transformer attention patterns
     //
     // Sharded memory
+    // Ported to Metal 2.0 (MetalV2FactoryConcept). See device/softmax_program_factory_attention_optimized_sharded.cpp.
     struct SoftmaxShardedProgramFactoryAttentionOptimized {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
     };
     // Interleaved memory
