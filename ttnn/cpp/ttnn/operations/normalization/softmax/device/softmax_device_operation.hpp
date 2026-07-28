@@ -61,8 +61,9 @@ struct SoftmaxDeviceOperation {
             const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
     };
     // Interleaved memory
+    // Ported to Metal 2.0 (MetalV2FactoryConcept). See device/softmax_program_factory_attention_optimized.cpp.
     struct SoftmaxProgramFactoryAttentionOptimized {
-        static tt::tt_metal::ProgramDescriptor create_descriptor(
+        static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
             const operation_attributes_t&, const tensor_args_t&, tensor_return_value_t&);
     };
 

@@ -2,10 +2,12 @@
 
 ## Outcome
 
-**PORTED (5 of 7 factories) + 2 remaining.** Five **General** factories
-(`SoftmaxProgramFactoryGeneral{WSmall,HSmall,HLarge,CLarge,WLarge}`) are converted to `MetalV2FactoryConcept`
-(`create_program_artifacts`), co-ported with `moreh/moreh_softmax` as the shared-kernel port-together set
-(issue #51081), and pass on device.
+**PORTED (6 of 7 factories) + 1 remaining.** Five **General** factories
+(`SoftmaxProgramFactoryGeneral{WSmall,HSmall,HLarge,CLarge,WLarge}`) plus the **interleaved Attention**
+factory (`SoftmaxProgramFactoryAttentionOptimized`) are converted to `MetalV2FactoryConcept`
+(`create_program_artifacts`) and pass on device. The General five were co-ported with `moreh/moreh_softmax`
+as the shared-kernel port-together set (issue #51081); the interleaved attention factory owns its own
+kernels and was ported independently in a later pass.
 
 `SoftmaxProgramFactoryGeneralWLarge` borrows the shared `moreh_softmax_w_large.cpp` compute kernel, whose
 faithful Metal 2.0 port initially triggered an out-of-scope **LLK addrmod `impossible constraint in 'asm'`
@@ -14,12 +16,14 @@ It is now **worked around** by a `noinline` split in that shared kernel (behavio
 proper fix is upstream in the LLK). Full detail in `moreh/moreh_softmax/METAL2_PORT_REPORT.md` →
 Handoff points; owner of the durable fix is the LLK team.
 
-The two **Attention** factories
-(`SoftmaxProgramFactoryAttentionOptimized` interleaved, `SoftmaxShardedProgramFactoryAttentionOptimized`
-sharded) remain on the legacy `descriptor` concept and are enumerated as the next pass — see
-[Open items](#open-items-for-downstream). The mixed-concept `program_factory_t` variant builds and
-dispatches per-factory: ported General factories → `ProgramSpecFactoryConcept`, attention factories →
-`ProgramDescriptorFactoryConcept`; `AllFactoriesValid` accepts the mix. Host build clean (exit 0).
+The **interleaved Attention** factory is now ported and device-verified (`fused/test_softmax.py` =
+373 passed / 1 skipped / 0 failed on wormhole_b0 — the full scale-mask / causal / numeric-stable /
+mask-padded / large-kernel / fp32 matrix). The **sharded Attention** factory
+(`SoftmaxShardedProgramFactoryAttentionOptimized`) remains on the legacy `descriptor` concept and is
+enumerated as the next pass — see [Open items](#open-items-for-downstream). The mixed-concept
+`program_factory_t` variant builds and dispatches per-factory: the six ported factories →
+`ProgramSpecFactoryConcept`, the sharded attention factory → `ProgramDescriptorFactoryConcept`;
+`AllFactoriesValid` accepts the mix. Host build clean (exit 0).
 
 This is a valid incremental deliverable per the recipe's factory-at-a-time guidance ("stopping after
 [some factories] with the rest enumerated for the next pass is the expected shape for a large op"). The
@@ -82,22 +86,37 @@ no op-owned tensors). Attention factories unchanged (`create_descriptor`).
 
 ## Open items for downstream
 
-- **Attention factories — remaining work (next pass).** Both are independent (own kernels under
-  `device/kernels/attention/`), so they merge without the moreh coupling. Full inventory is in
-  `METAL2_PORT_PLAN.md`. Notable complexity to budget for:
-  - **Interleaved** (`SoftmaxProgramFactoryAttentionOptimized`, `softmax_program_factory_attention_optimized.cpp`):
-    runtime source selection small/large (5 kernels convert atomically: `reader_unary_interleaved_sm{,_large_tensor}.cpp`,
-    `writer_unary_interleaved_start_id_blocked_sm.cpp`, `compute/softmax{,_large_tensor}.cpp`). Conditional
-    CBs across `FUSED_SCALE_MASK`/`CAUSAL_MASK`/`NUMERIC_STABLE`/`mask_padded_data`/`use_large_kernel`.
-    Requires: promote host-known `mask_padded_data` to a `#define` to conditionally bind c_5 pad-mask
-    (Conditional-DFB pattern); `#ifdef`-gate c_10 `cb_x` and the FUSED CBs (c_3/c_4/c_9); handle the
-    no-mask `cb_x = cb_exps` Same-FIFO alias; `mask` is an optional Case-1 tensor binding.
-  - **Sharded** (`SoftmaxShardedProgramFactoryAttentionOptimized`, `..._sharded.cpp`): borrowed-memory DFBs
-    (`borrowed_from`) for c_0 input, c_11 output, and c_3 when the mask is sharded; Case-1 mask when
-    interleaved/row-major; 3 runtime-selected readers (`reader_unary_sharded_sm{,_causal_mask_hw_dims,_rm_mask}.cpp`);
-    numeric_stable conditional CBs (c_9/c_10); no writer.
-  Neither was device-validatable in this pass's environment beyond host build; recommend porting each with
-  the confirmed nightly `fused/` tests (`test_softmax_interleaved.py`, `test_softmax_sharded.py`).
+- **Interleaved Attention factory — DONE (this pass).** `SoftmaxProgramFactoryAttentionOptimized` ported to
+  `create_program_artifacts` with all 5 runtime-selected kernels (`reader_unary_interleaved_sm{,_large_tensor}.cpp`,
+  `writer_unary_interleaved_start_id_blocked_sm.cpp`, `compute/softmax{,_large_tensor}.cpp`). Device-verified
+  (`fused/test_softmax.py` = 373 passed / 1 skipped). Key decisions, for the sharded pass to mirror:
+  - **`mask_padded_data` → `MASK_PADDED_DATA` define, on the *small* compute only** — needed to `#ifdef`-gate
+    the `c_10` (`cb_x`) reference, which the small kernel would otherwise emit unconditionally under
+    `NUMERIC_STABLE` even when the host doesn't allocate `c_10` (numeric-stable + no-mask + no-padding). The
+    writer and large compute keep `mask_padded_data` as a runtime arg (byte-identical runtime behavior).
+  - **`c_5` (pad-mask) bound unconditionally** (writer PRODUCER / compute CONSUMER, allocated always as legacy),
+    push/wait/pop runtime-gated. Avoided promoting it to a define, which kept the diff minimal.
+  - **FUSED CBs (`fused_scale` c_3, `fused_attn` c_4, `scale_mask` c_9) `#ifdef FUSED_SCALE_MASK`-gated** in both
+    compute kernels — their `dfb::` handles only exist when the compute binds them. Missing this gating was the
+    one build failure caught on device (non-fused softmax path); fixed by moving the `constexpr auto cb_* =
+    dfb::*` + object decls under `#if FUSED_SCALE_MASK`. **Lesson: every conditionally-bound DFB's file-scope
+    `dfb::name` alias must be `#ifdef`-gated, even if legacy declared the CB index unconditionally.**
+  - **Latent-bug observation (for kernel owners):** `compute/softmax_large_tensor.cpp` pops `c_5` (pad-mask)
+    **unconditionally** at end-of-`kernel_main` (`cb_mask_padded_obj.pop_front(1)`), but the writer only
+    *produces* `c_5` when `mask_padded_data` — so a large-kernel + non-padded config would pop with no push.
+    Preserved verbatim (not a porter fix); flagging because the Metal 2.0 binding makes the imbalance explicit.
+  - `mask` is an optional Case-1 tensor binding; single WorkUnitSpec over `all_cores` (one compute kernel, no
+    per-group CTA split, so no WU-disjointness concern).
+- **Sharded Attention factory — remaining work (next pass).** `SoftmaxShardedProgramFactoryAttentionOptimized`
+  is independent (owns kernels under `device/kernels/attention/`). Notable complexity to budget for:
+  borrowed-memory DFBs (`borrowed_from`) for `c_0` input, `c_11` output, and `c_3` when the mask is sharded;
+  Case-1 mask when interleaved/row-major; a `SHARDED_CAUSAL_MASK` axis under which `c_3` flips from
+  reader-produced (1P+1C) to borrowed-self-loop (the reader stops touching it); 3 runtime-selected readers
+  (`reader_unary_sharded_sm{,_causal_mask_hw_dims,_rm_mask}.cpp`, each reading a different subset of the
+  positional CTA layout — clean up to named CTAs); numeric_stable conditional CBs (`c_9`/`c_10`); no writer.
+  The sharded compute (`compute/softmax_sharded.cpp`) is the same shape as the interleaved small compute
+  (drafted once in this pass, then reverted to keep the legacy factory consistent). Port with the sharded
+  cases in `fused/test_softmax.py::test_softmax_sharded_stable_with_program_cache`.
 - **Cross-op kernel touches:** the 15 borrowed kernels were modified **in place** (not forked); consumer set
   {`normalization/softmax` General, `moreh/moreh_softmax`} both migrated in this PR. Nothing to sunset.
 
@@ -105,8 +124,9 @@ no op-owned tensors). Attention factories unchanged (`create_descriptor`).
 
 - **Build:** `./build_metal.sh --build-tests` → SUCCESS (exit 0, no errors, `AllFactoriesValid` satisfied).
 - **Device tests:** `scripts/run_safe_pytest.sh --run-all tests/ttnn/unit_tests/operations/fused/test_softmax.py`
-  → **373 passed, 1 skipped, 0 failed** (covers the ported General path — 3D/5D/multi-dim softmax — plus the
-  untouched attention path; no JIT failures). The moreh nightly test (which shares the ported kernels,
+  → **373 passed, 1 skipped, 0 failed** (covers the ported General path — 3D/5D/multi-dim softmax — **and the
+  now-ported interleaved Attention path** — scale-mask, causal, numeric-stable, mask-padded, large-kernel, fp32;
+  the sharded cases run the still-legacy sharded factory; no JIT failures). The moreh nightly test (which shares the ported kernels,
   including w_large with the `noinline` workaround) is fully green (93 passed). The w_large+fp32 JIT failure
   surfaced only in that moreh nightly test — the fused suite here does not exercise General w_large + fp32 —
   and is now resolved by the shared-kernel workaround described above.
