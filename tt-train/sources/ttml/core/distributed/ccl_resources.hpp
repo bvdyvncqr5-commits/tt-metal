@@ -20,7 +20,7 @@ public:
     std::vector<tt::tt_metal::GlobalSemaphore> get_all_reduce_barrier_semaphores();
 
 private:
-    static constexpr uint32_t kNumSemaphoresPairs = 2U;
+    static constexpr uint32_t kNumSemaphoresPairs = 8U;
     static constexpr uint32_t kNumSemaphoresPerAllGather = 2U;
     static constexpr uint32_t kNumSemaphoresPerReduceScatterCall = 3U;
     static constexpr uint32_t kNumSemaphoresPerAllReduceBarrierCall = 2U;
