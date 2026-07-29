@@ -95,9 +95,12 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
     std::uint32_t sum_scaler_tile_size = tt::tile_size(sum_scaler_cb_data_format);
 
     const bool mask_sharded = has_mask && tensor_args.mask->is_sharded();
-    // The reader gates its mask-read (and thus the c_3 binding) on SHARDED_CAUSAL_MASK; c_3 is a
-    // borrowed-memory DFB the compute reads directly exactly on that path.
-    const bool mask_sharded_resident = has_mask && attributes.is_causal_mask && mask_sharded;
+    // c_3 is a borrowed-memory DFB the compute reads directly (self-loop) only when the *default*
+    // sharded reader is selected — that reader alone honors SHARDED_CAUSAL_MASK and skips the mask read.
+    // The hw-dims and row-major readers always stream the mask themselves (c_3 reader-produced, 1P+1C),
+    // so the resident path must exclude them or those readers would reference args/DFBs the host withholds.
+    const bool mask_sharded_resident =
+        has_mask && attributes.is_causal_mask && mask_sharded && !attributes.is_scale_causal_mask_hw_dims_softmax;
     // hw_dims_only_causal_mask does not support RM Layout atm
     const bool use_row_major_kernel = has_mask && tensor_args.mask->layout() == tt::tt_metal::Layout::ROW_MAJOR;
 
@@ -175,8 +178,8 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
             .entry_size = mask_tile_size,
             .num_entries = attn_num_entries,
             .data_format_metadata = mask_cb_data_format};
-        if (mask_sharded) {
-            attn_spec.borrowed_from = MASK;  // sharded-resident mask backs c_3 directly
+        if (mask_sharded_resident) {
+            attn_spec.borrowed_from = MASK;  // default sharded reader leaves c_3 resident (compute self-loop)
         }
         dfbs.push_back(attn_spec);
     }
@@ -213,7 +216,10 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
     }
     if (attributes.is_causal_mask) {
         reader_defines["CAUSAL_MASK"] = "1";
-        if (mask_sharded) {
+        // SHARDED_CAUSAL_MASK tells the compute to treat c_3 as resident (skip wait_front) and the default
+        // reader to skip the mask read. Keyed on mask_sharded_resident so it stays off for the hw-dims path,
+        // where the reader streams c_3 and the compute must wait for it (1P+1C).
+        if (mask_sharded_resident) {
             reader_defines["SHARDED_CAUSAL_MASK"] = "1";
         }
     }
