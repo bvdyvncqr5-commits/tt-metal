@@ -66,7 +66,11 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
 
     // Circular-buffer formats
     const auto data_format = datatype_to_dataformat_converter(input.dtype());
+    // Use Float16_b for intermediates when not accumulating in fp32, matching the AttentionOptimized path.
+    // This avoids using Bfp8_b for intermediate computations where it lacks precision (issue #32934).
     const auto intermed_data_format = fp32_dest_acc_en ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
+    // Reader generates mask/scaler with uint16_t (1024 elements = 2048 bytes). Use Float16_b for these CBs when
+    // input is Bfp8_b so tile size matches; Bfp8_b tile layout is smaller and would be overflowed (issue #32934).
     const auto mask_scaler_format = (data_format == tt::DataFormat::Bfp8_b) ? tt::DataFormat::Float16_b : data_format;
 
     const std::uint32_t in_tile_size = tt::tile_size(data_format);
@@ -172,6 +176,8 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
 
     KernelSpec::CompilerOptions::Defines compute_defines;
     compute_defines["SOFTMAX"] = "1";
+    // Enable FP32_DEST_ACC_EN for format reconfiguration in moreh compute helpers when using mixed
+    // data formats (Bfp8_b input with Float16_b intermediates/mask/scaler) (issue #32934).
     if (fp32_dest_acc_en || data_format == tt::DataFormat::Bfp8_b) {
         compute_defines["FP32_DEST_ACC_EN"] = "1";
     }
