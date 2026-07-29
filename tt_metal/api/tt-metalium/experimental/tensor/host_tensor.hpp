@@ -105,8 +105,8 @@ public:
     static HostTensor from_buffer(HostBuffer buffer, TensorSpec spec, TensorTopology topology);
 
     /**
-     * Allocate a single-shard HostTensor whose contents are unspecified and must be overwritten.
-     * Equivalent to `from_buffer(HostBuffer(...), spec, TensorTopology{})`.
+     * Allocate a single-shard HostTensor whose contents are unspecified and meant to be overwritten.
+     * The buffer occupies the 0x0 shard of the distributed host buffer.
      */
     static HostTensor allocate_for_overwrite(const TensorSpec& spec);
 
