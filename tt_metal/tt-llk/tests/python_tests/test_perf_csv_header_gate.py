@@ -2,13 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Merge gate: perf-CSV header names must not drift from the golden catalog.
+"""Merge gate: perf-CSV column headers must be unique by construction.
 
-The hand-maintained catalog in ``helpers/perf_schema.py`` is the single source
-of truth for perf-CSV header names. These tests read the LIVE source with
-``ast`` and fail if it drifts from the catalog, so a header rename cannot merge
-without a deliberate catalog edit. They parse the source only, so they need no
-hardware and run in any CI lane.
+A perf-report sweep column is named after a parameter dataclass field. If two
+parameter classes declare the same field name, a test that passes both produces
+two columns with the same header — a duplicate the CSV pipeline cannot represent
+(it ships a phantom ``<name>.1`` column and silently skips the row collapse).
+
+This test enforces the invariant that makes that impossible: every parameter
+field name is unique across all ``TemplateParameter``/``RuntimeParameter``
+classes, and no field name equals a fixed sweep header. It parses the source
+with ``ast``, so it needs no hardware and runs in any CI lane.
+
+A new test or parameter that would reintroduce a duplicate header fails this
+test, so the pull request cannot merge. (The same-parameter-passed-twice case is
+caught at run time by the gate in ``PerfReport.append``.)
 """
 
 import ast
@@ -34,6 +42,19 @@ def _load_perf_schema():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _reserved_headers() -> set:
+    """Columns the pipeline injects itself, which no parameter field may shadow.
+
+    Beyond the fixed sweep headers, this reserves ``marker`` (the merge key — a
+    param named ``marker`` would be suffixed to ``marker_x``/``marker_y`` by the
+    cross-merge, evade the duplicate gate, and break marker processing) and
+    ``test_name``. ``loop_factor``/``tile_cnt`` are intentionally NOT reserved:
+    they ARE parameter fields (``LOOP_FACTOR``/``TILE_COUNT``).
+    """
+    ps = _load_perf_schema()
+    return set(ps.FIXED_SWEEP_HEADERS) | {ps.MARKER, ps.TEST_NAME_COLUMN}
 
 
 def _collect_parameter_fields() -> dict:
@@ -64,6 +85,115 @@ def _collect_parameter_fields() -> dict:
     return field_owners
 
 
+# Checks if two or more classes share a field name
+# For every parameter field it checks if it has multiple "owners" (classes)
+def test_parameter_field_names_are_globally_unique():
+    field_owners = _collect_parameter_fields()
+    clashes = {
+        field: owners
+        for field, owners in field_owners.items()
+        if len({cls for cls, _ in owners}) > 1
+    }
+
+    lines = [
+        "Duplicate perf-CSV headers are possible: a parameter field name is "
+        "declared by more than one class. Two params that share a field name "
+        "produce two columns with the same header when a test passes both.",
+        "",
+    ]
+    for field, owners in sorted(clashes.items()):
+        lines.append(f"  field '{field}':")
+        for cls, rel in sorted(set(owners)):
+            lines.append(f"      {cls}  ({rel})")
+    lines.append("")
+    lines.append("Rename one field so every parameter field name is unique.")
+
+    assert not clashes, "\n".join(lines)
+
+
+def _collect_parameter_declarations():
+    """(class_name, frozenset(fields), rel_path) for every parameter ClassDef."""
+    decls = []
+    for path in _iter_source_files():
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if not any(
+                isinstance(base, ast.Name) and base.id in PARAM_BASES
+                for base in node.bases
+            ):
+                continue
+            fields = frozenset(
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign)
+                and isinstance(stmt.target, ast.Name)
+                and not stmt.target.id.startswith("_")
+            )
+            decls.append((node.name, fields, path.relative_to(ROOT).as_posix()))
+    return decls
+
+
+# The uniqueness check above groups by class NAME, so a class declared twice
+# collapses to one owner. Catch the dangerous case it misses: the same class
+# name defined more than once with DIFFERENT fields, where the later definition
+# silently shadows the earlier one. Identical re-declarations (same fields, e.g.
+# a param copied across two test files) are benign and allowed.
+def test_no_shadowed_parameter_class():
+    by_name: dict[str, list] = {}
+    for name, fields, rel in _collect_parameter_declarations():
+        by_name.setdefault(name, []).append((fields, rel))
+    shadowed = {
+        name: decls
+        for name, decls in by_name.items()
+        if len({fields for fields, _ in decls}) > 1
+    }
+    lines = [
+        "A parameter class is declared more than once with different fields; the "
+        "later definition silently shadows the earlier one (only the last binding "
+        "wins), and the name-only uniqueness check cannot see it.",
+        "",
+    ]
+    for name, decls in sorted(shadowed.items()):
+        lines.append(f"  class '{name}':")
+        for fields, rel in sorted(decls, key=lambda d: d[1]):
+            lines.append(f"      {rel}: fields={sorted(fields)}")
+    lines.append("")
+    lines.append("Consolidate to one definition, or give them distinct class names.")
+
+    assert not shadowed, "\n".join(lines)
+
+
+# Checks if there is a parameter named the same as a reserved header
+# Reserved = FIXED_SWEEP_HEADERS plus marker/test_name (see _reserved_headers)
+# For example if you added a new @dataclass
+# class SOME_NEW_RANDOM_PARAM_WE_MADE_UP(TemplateParameter):
+# dest_acc: bool = False
+
+
+# This test would fail, because it would produce duplicate columns
+def test_no_parameter_field_equals_a_fixed_header():
+    reserved = _reserved_headers()
+    field_owners = _collect_parameter_fields()
+    clashes = {f: owners for f, owners in field_owners.items() if f in reserved}
+
+    assert not clashes, (
+        f"Parameter field name(s) collide with reserved headers "
+        f"{sorted(reserved)}: {clashes}. Rename the offending field."
+    )
+
+
+# Golden-catalog drift gate
+#
+# The hand-maintained catalog in perf_schema.py is the single source of
+# header names. These tests read the LIVE source with ast and fail if it drifts
+# from the catalog, so a header rename cannot merge without a deliberate catalog edit.
+
+
 def _enum_member_names(module_filename: str, enum_name: str) -> set:
     """Names assigned in an Enum class body, read statically (no import)."""
     path = ROOT / "helpers" / module_filename
@@ -80,6 +210,8 @@ def _enum_member_names(module_filename: str, enum_name: str) -> set:
     return set()
 
 
+# Checks if there is added perf sweep parameters that dont align with the ones
+# defined in the catalog.
 def test_sweep_params_match_golden_catalog():
     ps = _load_perf_schema()
     live = set(_collect_parameter_fields())
@@ -102,6 +234,7 @@ def test_sweep_params_match_golden_catalog():
     assert not added and not removed, "\n".join(lines)
 
 
+# Same as above, just for run type params
 def test_run_type_names_match_source():
     ps = _load_perf_schema()
     live = _enum_member_names("llk_params.py", "PerfRunType")
@@ -112,6 +245,7 @@ def test_run_type_names_match_source():
     )
 
 
+# Same as above, just for metrics
 def test_metric_bases_match_source():
     """The catalog's metric bases must equal the *_pct dict keys metrics.py exports."""
     tree = ast.parse((ROOT / "helpers" / "metrics.py").read_text())
@@ -134,3 +268,99 @@ def test_metric_bases_match_source():
         f"{sorted(live - set(ps.METRIC_BASES))}; in catalog but not source: "
         f"{sorted(set(ps.METRIC_BASES) - live)}. Update perf_schema.METRIC_BASES."
     )
+
+
+PARAM_LIST_KWARGS = {"templates", "runtimes"}
+
+
+# This tests how are classes used in tests, because even though we may not have a class with duplicate field
+# We can still use that class in a wrong way and cause duplicate columns, for example:
+# class RNDM_CLASS(RuntimeParameter):
+# input_tile_cnt: int = 0 - this is cool, its unique
+# BUT, if we do
+# runtimes=(RNDM_CLASS(4), RNDM_CLASS(8)) we still produce duplicate columns of tile_cnt?
+def _configs_with_duplicate_param_types():
+    problems = []  # (path, lineno, [duplicated type names])
+    for path in _iter_source_files():
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            names = []
+            for kw in node.keywords:
+                if kw.arg in PARAM_LIST_KWARGS and isinstance(
+                    kw.value, (ast.List, ast.Tuple, ast.Set)
+                ):
+                    for elt in kw.value.elts:
+                        if not isinstance(elt, ast.Call):
+                            continue
+                        # X(...) -> "X";  module.X(...) -> "X"
+                        if isinstance(elt.func, ast.Name):
+                            names.append(elt.func.id)
+                        elif isinstance(elt.func, ast.Attribute):
+                            names.append(elt.func.attr)
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                problems.append((path.relative_to(ROOT).as_posix(), node.lineno, dupes))
+    return problems
+
+
+# Explained above
+def test_no_param_type_used_twice_in_one_config():
+    problems = _configs_with_duplicate_param_types()
+    lines = [
+        "A parameter type is used more than once in a single test config. Each "
+        "use emits the same CSV header, so the report gets a duplicate column.",
+        "",
+    ]
+    for path, lineno, dupes in problems:
+        lines.append(f"  {path}:{lineno}: used twice -> {dupes}")
+    lines += [
+        "",
+        "Use each parameter type at most once per config. If you need two of the "
+        "same quantity, model them as distinct parameter types with unique field "
+        "names (e.g. INPUT_TILE_CNT vs OUTPUT_TILE_CNT).",
+    ]
+    assert not problems, "\n".join(lines)
+
+
+# Unit coverage for the perf_schema gate and name builders
+
+
+def test_find_duplicate_columns():
+    ps = _load_perf_schema()
+    assert ps.find_duplicate_columns(["a", "b", "a", "c", "b"]) == ["a", "b"]
+    assert ps.find_duplicate_columns(["a", "b", "c"]) == []
+
+
+def test_assert_unique_columns_passes_on_unique():
+    ps = _load_perf_schema()
+    # No exception expected.
+    ps.assert_unique_columns(["formats.input_A", "mathop", "marker", "mean(L1_TO_L1)"])
+
+
+def test_assert_unique_columns_raises_on_duplicate():
+    ps = _load_perf_schema()
+    raised = False
+    try:
+        ps.assert_unique_columns(
+            ["dest_acc", "tile_cnt", "tile_cnt", "marker"], context="bad"
+        )
+    except ps.PerfSchemaError as exc:
+        raised = True
+        assert "tile_cnt" in str(exc)
+    assert raised, "assert_unique_columns must raise PerfSchemaError on a duplicate"
+
+
+def test_column_name_builders():
+    ps = _load_perf_schema()
+    rt = "L1_TO_L1"
+    assert ps.stat_column(rt, ps.MEAN) == "mean(L1_TO_L1)"
+    assert ps.stat_prefix(ps.STD) == "std("
+    assert ps.metric_column(rt, "fpu_utilization_pct") == "L1_TO_L1_fpu_utilization_pct"
+    assert ps.text_size_column(rt) == "TEXT_SIZE(L1_TO_L1)"
+    assert ps.counter_base("FPU", "FPU_COUNTER") == "FPU.FPU_COUNTER"
+    assert ps.cycles_of("FPU.FPU_COUNTER") == "FPU.FPU_COUNTER.cycles"
