@@ -409,7 +409,7 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
 
     std::uint32_t num_tiles_in_attn_mask = 0;
     std::uint32_t num_tiles_of_attn_mask_needed_per_core = 0;
-    if (attributes.is_scale_causal_mask_hw_dims_softmax) {
+    if (has_mask && attributes.is_scale_causal_mask_hw_dims_softmax) {
         num_tiles_in_attn_mask = tensor_args.mask->padded_shape()[-1] * tensor_args.mask->padded_shape()[-2] / tile_hw;
         num_tiles_of_attn_mask_needed_per_core = program_config.block_h * program_config.block_w;
     }
