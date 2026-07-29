@@ -4,7 +4,7 @@
 
 // NOTE: this factory borrows the shared moreh_softmax_w_large.cpp compute kernel, whose fp32_dest_acc_en
 // path once failed to JIT-compile (LLK addrmod "impossible constraint in 'asm'"). It is worked around by a
-// noinline split in that kernel — see its top-of-file WORKAROUND note and METAL2_PORT_REPORT.md. The proper
+// noinline split in that kernel — see its top-of-file WORKAROUND note. The proper
 // fix is upstream in the LLK (make the addrmod value a compile-time constant).
 
 #include "softmax_device_operation.hpp"

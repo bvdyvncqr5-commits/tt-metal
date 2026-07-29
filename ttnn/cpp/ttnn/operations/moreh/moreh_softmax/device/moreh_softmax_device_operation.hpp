@@ -52,7 +52,7 @@ struct MorehSoftmaxOperation {
 // from create_program_artifacts. See device/softmax_*/softmax_*.cpp.
 // NOTE (w_large): the fp32_dest_acc_en path once hit an LLK addrmod "impossible constraint in 'asm'"
 // JIT failure; it is worked around by a noinline split in moreh_softmax_w_large.cpp (see that kernel's
-// top-of-file WORKAROUND note and METAL2_PORT_REPORT.md). Proper fix is upstream in the LLK.
+// top-of-file WORKAROUND note). Proper fix is upstream in the LLK.
 #define DEFINE_SOFTMAX_FACTORY(factory_name)                                      \
     struct factory_name {                                                         \
         static ttnn::device_operation::ProgramArtifacts create_program_artifacts( \

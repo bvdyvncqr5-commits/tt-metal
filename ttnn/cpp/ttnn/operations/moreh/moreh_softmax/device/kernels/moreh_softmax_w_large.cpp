@@ -11,7 +11,7 @@
 // budget so the immediates fold again. Behavior is unchanged (a plain function boundary); legacy compiled
 // only because its smaller TU stayed under the budget. This is a stopgap: the proper fix is upstream in the
 // LLK (make the addrmod value a compile-time constant, not just the index — templatizing the index alone
-// was verified insufficient). See METAL2_PORT_REPORT.md.
+// was verified insufficient).
 
 #include <cstdint>
 
