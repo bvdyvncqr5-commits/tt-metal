@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <tt-metalium/experimental/tensor/host_tensor.hpp>
-#include <tt-metalium/experimental/tensor/impl/tensor_impl.hpp>
 
 #include "host_tensor_impl.hpp"
 #include "spec/layout/tensor_layout_impl.hpp"
+#include "tensor_buffer_alloc.hpp"
 
 namespace tt::tt_metal {
 
