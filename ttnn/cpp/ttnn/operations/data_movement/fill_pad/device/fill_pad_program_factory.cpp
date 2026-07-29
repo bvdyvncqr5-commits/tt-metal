@@ -90,7 +90,7 @@ ttnn::device_operation::ProgramArtifacts FillPadProgramFactory::create_program_a
     const m2::KernelSpecName WRITER{"writer"};
     const m2::KernelSpecName COMPUTE{"compute"};
 
-    const tt::tt_metal::PadValue& fill_value = operation_attributes.fill_value;
+    const ttnn::PadValue& fill_value = operation_attributes.fill_value;
     tt::tt_metal::IDevice* device = input_tensor.device();
 
     const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
@@ -392,7 +392,7 @@ ttnn::device_operation::ProgramArtifacts FillPadL1ShardedProgramFactory::create_
     const m2::DFBSpecName DATA_OUT{"data_out"};
     const m2::TensorParamName INPUT{"input"};
 
-    const tt::tt_metal::PadValue& fill_value = operation_attributes.fill_value;
+    const ttnn::PadValue& fill_value = operation_attributes.fill_value;
 
     const tt::DataFormat cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(input_tensor.dtype());
 
