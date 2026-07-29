@@ -13,6 +13,7 @@
 
 #include "host_tensor_impl.hpp"
 #include "mesh_tensor_impl.hpp"
+#include "tensor_impl.hpp"
 
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/experimental/tensor/tensor_apis.hpp>
