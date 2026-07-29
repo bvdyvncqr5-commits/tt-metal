@@ -22,11 +22,10 @@ Both Attention factories are device-verified on wormhole_b0 via `fused/test_soft
 large-kernel / fp32 matrix (interleaved) and the sharded `test_softmax_sharded_stable_with_program_cache`
 matrix (bf16 / bf8 / fp32 × scale-mask × numeric-stable). Host build clean (exit 0).
 
-This is a valid incremental deliverable per the recipe's factory-at-a-time guidance ("stopping after
-[some factories] with the rest enumerated for the next pass is the expected shape for a large op"). The
-General factories were the coordination-critical half (they force the shared-kernel rewrite that
-`moreh/moreh_softmax` also depends on); the Attention factories are independent (own their kernels) and
-can merge on their own timeline.
+The op was ported across several passes per the recipe's factory-at-a-time guidance — the General factories
+first (the coordination-critical half: they force the shared-kernel rewrite that `moreh/moreh_softmax` also
+depends on), then the two Attention factories (independent, own their kernels) in later passes. Each pass
+landed a mixed-concept `program_factory_t` variant that built and ran; the op is now fully converted.
 
 ## Provenance
 
@@ -62,9 +61,10 @@ no op-owned tensors). Attention factories unchanged (`create_descriptor`).
 
 ## Successes
 
-- **Mixed-concept `program_factory_t` variant** — porting 5 of 7 factories while leaving 2 on
-  `create_descriptor` builds cleanly; `AllFactoriesValid` accepts the mix exactly as the recipe/TTNN-factory
-  doc describe. This is what makes the incremental (factory-at-a-time) delivery real.
+- **Mixed-concept `program_factory_t` variant** — during the intermediate passes, a partially-ported variant
+  (some factories on `create_program_artifacts`, the rest still on `create_descriptor`) built cleanly and ran;
+  `AllFactoriesValid` accepted the mix exactly as the recipe/TTNN-factory doc describe. This is what made the
+  incremental (factory-at-a-time) delivery real. The final variant is all-`create_program_artifacts`.
 - Same successes as the moreh report (Same-FIFO alias, self-loop intermediates, preserved g1/g2
   multiplicity, `get_entry_size` on DM kernels) — the General factories share the kernels and pattern.
 
