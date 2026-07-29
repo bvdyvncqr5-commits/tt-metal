@@ -25,6 +25,8 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
     const operation_attributes_t& attributes, const tensor_args_t& tensor_args, tensor_return_value_t& output_tensor) {
     using namespace tt::tt_metal;
 
+    log_debug(tt::LogMetal, "SoftmaxProgramFactoryAttentionOptimizedSharded selected");
+
     const auto& input_tensor = tensor_args.input_tensor;
     auto* device = input_tensor.device();
     const auto arch = device->arch();
@@ -49,6 +51,17 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
         in0_cb_data_format == tt::DataFormat::Float32 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
     const tt::DataFormat sum_scaler_cb_data_format =
         im_cb_data_format == tt::DataFormat::Float32 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
+
+    log_debug(tt::LogOp, "in0_cb_data_format: {}", in0_cb_data_format);
+    log_debug(tt::LogOp, "out0_cb_data_format: {}", out0_cb_data_format);
+    log_debug(tt::LogOp, "mask_cb_data_format: {}", mask_cb_data_format);
+    log_debug(tt::LogOp, "im_cb_data_format: {}", im_cb_data_format);
+    log_debug(tt::LogOp, "fused_attention_scale_cb_data_format: {}", im_cb_data_format);
+    log_debug(tt::LogOp, "max_scaler_cb_data_format: {}", max_scaler_cb_data_format);
+    log_debug(tt::LogOp, "sum_scaler_cb_data_format: {}", sum_scaler_cb_data_format);
+    log_debug(tt::LogOp, "math_fidelity: {}", math_fidelity);
+    log_debug(tt::LogOp, "math_approx_mode: {}", math_approx_mode);
+    log_debug(tt::LogOp, "fp32_dest_acc_en: {}", fp32_dest_acc_en);
 
     // tensor shape
     const auto shard_orient = input_tensor.shard_spec().value().orientation;
@@ -85,6 +98,7 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
     // The reader gates its mask-read (and thus the c_3 binding) on SHARDED_CAUSAL_MASK; c_3 is a
     // borrowed-memory DFB the compute reads directly exactly on that path.
     const bool mask_sharded_resident = has_mask && attributes.is_causal_mask && mask_sharded;
+    // hw_dims_only_causal_mask does not support RM Layout atm
     const bool use_row_major_kernel = has_mask && tensor_args.mask->layout() == tt::tt_metal::Layout::ROW_MAJOR;
 
     // c_3 (attn mask) entry count — mirrors legacy in3_CB_size / mask_tile_size.
@@ -95,7 +109,9 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
         } else {
             attn_num_entries = program_config.block_w;
             if (!attributes.is_scale_causal_mask_hw_dims_softmax) {
-                attn_num_entries *= 2;  // double-buffer c_3 for the non-hw-dims causal path
+                // For some reason, if we have hw_dims_causal_mask version, single buffering is up to ~20% faster
+                // Then double buffering CB3.
+                attn_num_entries *= 2;
             }
         }
     }

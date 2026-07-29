@@ -97,6 +97,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
     const DFBSpecName MAX{"max"};
     const DFBSpecName TMP{"tmp"};
 
+    // Circular buffers
     Group<DataflowBufferSpec> dfbs = {
         DataflowBufferSpec{
             .unique_id = IN, .entry_size = in_tile_size, .num_entries = 2, .data_format_metadata = data_format},
@@ -122,11 +123,13 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
             .entry_size = intermed_tile_size,
             .num_entries = 2,
             .data_format_metadata = intermed_data_format},
+        // reduce
         DataflowBufferSpec{
             .unique_id = RECIP,
             .entry_size = intermed_tile_size,
             .num_entries = 1,
             .data_format_metadata = intermed_data_format},
+        // syn
         DataflowBufferSpec{
             .unique_id = ADD,
             .entry_size = intermed_tile_size,
@@ -144,6 +147,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
             .data_format_metadata = intermed_data_format},
     };
 
+    // Data movement kernels
     KernelSpec reader{
         .unique_id = READER,
         .source = std::string(SOFTMAX_KERNEL_PATH_GENERAL) + "/reader_moreh_softmax_w_large.cpp",
@@ -174,6 +178,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
         .hw_config = ttnn::create_writer_datamovement_config(arch),
     };
 
+    // Compute kernels
     KernelSpec::CompilerOptions::Defines compute_defines;
     compute_defines["SOFTMAX"] = "1";
     // Enable FP32_DEST_ACC_EN for format reconfiguration in moreh compute helpers when using mixed
@@ -260,6 +265,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
         .work_units = std::move(work_units),
     };
 
+    // Runtime Args
     ProgramRunArgs run_args;
     KernelRunArgs reader_ra{.kernel = READER};
     KernelRunArgs writer_ra{.kernel = WRITER};
@@ -283,6 +289,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWLarge::create_program_artif
             TT_THROW("Core not in specified core ranges");
         }
 
+        // Reader computes the reduce scaler in-kernel; only shape-derived args are passed.
         AddRuntimeArgsForNode(
             reader_ra.runtime_arg_values,
             core,

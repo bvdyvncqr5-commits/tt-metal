@@ -36,6 +36,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxCLar
     auto* device = input.device();
     auto grid_coord = device->compute_with_storage_grid_size();
     const CoreRange core_range({0, 0}, {grid_coord.x - 1, grid_coord.y - 1});
+    // split work
     auto shape = input.padded_shape();
     auto H = shape[-2];
     auto W = shape[-1];
@@ -59,6 +60,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxCLar
             "compute kernel configuration.");
     }
 
+    // create circular buffers
     auto data_format = tt::tt_metal::datatype_to_dataformat_converter(input.dtype());
     auto intermed_data_format = fp32_dest_acc_en ? tt::DataFormat::Float32 : data_format;
     const std::uint32_t tile_size_data = tile_size(data_format);
@@ -110,6 +112,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxCLar
             .data_format_metadata = intermed_data_format},
     };
 
+    // create read/write kernel
     KernelSpec reader{
         .unique_id = READER,
         .source = "ttnn/cpp/ttnn/operations/moreh/moreh_softmax/device/kernels/reader_moreh_softmax_c_large.cpp",
@@ -152,6 +155,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxCLar
         compute_defines["FP32_DEST_ACC_EN"] = "1";
     }
 
+    // create compute kernel
     auto make_compute_hw = [&]() {
         auto hw = ttnn::to_compute_hardware_config(arch, compute_kernel_config);
         if (fp32_dest_acc_en) {
@@ -222,6 +226,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxCLar
         .work_units = std::move(work_units),
     };
 
+    // Set Runtime Args
     ProgramRunArgs run_args;
     KernelRunArgs reader_ra{.kernel = READER};
     KernelRunArgs writer_ra{.kernel = WRITER};

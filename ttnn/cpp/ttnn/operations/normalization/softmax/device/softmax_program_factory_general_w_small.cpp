@@ -119,6 +119,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWSmall::create_program_artif
             .entry_size = intermed_tile_size,
             .num_entries = Wt,
             .data_format_metadata = intermed_data_format},
+        // reduce
         DataflowBufferSpec{
             .unique_id = RECIP,
             .entry_size = intermed_tile_size,
@@ -293,6 +294,7 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryGeneralWSmall::create_program_artif
             TT_THROW("Core not in specified core ranges");
         }
 
+        // Reader computes the reduce scaler in-kernel; only shape-derived args are passed.
         AddRuntimeArgsForNode(
             reader_ra.runtime_arg_values,
             core,

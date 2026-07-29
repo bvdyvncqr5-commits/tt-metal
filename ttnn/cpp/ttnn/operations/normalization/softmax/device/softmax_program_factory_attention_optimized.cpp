@@ -371,6 +371,11 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
         .hw_config = ttnn::create_writer_datamovement_config(arch),
     };
 
+    // for broadcasting in H direction we need to
+    // NCHt, Nt, Wt
+    // if wtpc < Ht then since we pass tpc to the kernel as Ht, the broadcasts should be correct
+    // if wtpc >= Ht then tpc should be a multiple of Ht
+
     // ---- Compute kernel ----
     Group<DFBBinding> compute_bindings = {
         DFBBinding{.dfb_spec_name = IN0, .accessor_name = "in0", .endpoint_type = DFBEndpointType::CONSUMER},

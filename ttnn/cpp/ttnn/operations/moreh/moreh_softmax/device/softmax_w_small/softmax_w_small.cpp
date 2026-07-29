@@ -110,6 +110,7 @@ ttnn::device_operation::ProgramArtifacts MorehSoftmaxOperation::MorehSoftmaxWSma
             .entry_size = tile_size_intermed,
             .num_entries = Wt,
             .data_format_metadata = intermed_data_format},
+        // reduce output
         DataflowBufferSpec{
             .unique_id = RECIP,
             .entry_size = tile_size_intermed,
