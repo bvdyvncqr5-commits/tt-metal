@@ -36,6 +36,12 @@ SoftmaxDeviceOperation::SoftmaxShardedProgramFactoryAttentionOptimized::create_p
         "Input tensor must be sharded when using SoftmaxShardedMultiCoreProgramConfig");
 
     const bool has_mask = tensor_args.mask.has_value();
+    // is_causal_mask without an actual mask is contradictory and unsupported. Fail cleanly here rather
+    // than letting a CAUSAL_MASK-without-FUSED_SCALE_MASK kernel reach JIT and fail opaquely (the host
+    // used to throw std::bad_optional_access on this input before the mask-arg reads were guarded).
+    TT_FATAL(
+        has_mask || !attributes.is_causal_mask,
+        "Causal-mask softmax requires an attention mask (is_causal_mask=true with no mask is unsupported).");
 
     const tt::DataFormat in0_cb_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
 

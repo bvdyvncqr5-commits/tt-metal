@@ -40,6 +40,12 @@ SoftmaxDeviceOperation::SoftmaxProgramFactoryAttentionOptimized::create_program_
     const auto& shape_unpadded = input_tensor.logical_shape();
 
     const bool has_mask = tensor_args.mask.has_value();
+    // is_causal_mask without an actual mask is contradictory and unsupported. Fail cleanly here rather
+    // than letting a CAUSAL_MASK-without-FUSED_SCALE_MASK kernel reach JIT and fail opaquely (the host
+    // used to throw std::bad_optional_access on this input before the mask-arg reads were guarded).
+    TT_FATAL(
+        has_mask || !attributes.is_causal_mask,
+        "Causal-mask softmax requires an attention mask (is_causal_mask=true with no mask is unsupported).");
 
     bool mask_padded_data = false;
     std::uint32_t num_datum_padded = 0;
