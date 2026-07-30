@@ -1517,10 +1517,6 @@ template HostTensor to_tensor_spec<uint8_t>(const HostTensor&, const TensorSpec&
 //                                  Utility functions
 // ======================================================================================
 
-bool logical_matches_physical(const TensorSpec& tensor_spec) {
-    return tensor_spec.layout() == Layout::ROW_MAJOR && tensor_spec.logical_2d_shape() == tensor_spec.physical_shape();
-}
-
 namespace host_buffer {
 
 namespace {
