@@ -59,7 +59,15 @@ void kernel_main() {
     CircularBuffer index_tensor_cb(index_tensor_cb_index);
     CircularBuffer rm_coord_value_row(rm_coord_value_row_cb);
     CircularBuffer rm_coord_index_row(rm_coord_index_row_cb);
-    const uint32_t input_tensor_tile_size = get_tile_size(input_tensor_cb_index);
+    // The coordinator's TILE-branch passthrough DMAs data raw from the input DRAM
+    // buffer into c_0 and back out to the output DRAM buffer.  For UINT16 inputs
+    // c_0 is a Float32 CB (see SortProgramFactorySingleRowMultiCore), so
+    // get_tile_size(c_0) returns the enlarged 4KB Float32 page size — but the
+    // DRAM tiles are still UInt16 (2KB).  Using c_0's page size for the DMA byte
+    // count would overrun the source/destination tile boundary.  Derive the raw
+    // input tile byte count from W_tile_bytes (already sized for the raw input
+    // dtype) so the passthrough copies the correct number of bytes in every mode.
+    constexpr uint32_t raw_input_tile_bytes = TILE_H * W_tile_bytes;
     const uint32_t index_tensor_tile_size = get_tile_size(index_tensor_cb_index);
 
     // Semaphore setup
@@ -161,7 +169,7 @@ void kernel_main() {
                 noc.async_read(
                     input_tensor_addr_ger,
                     input_tensor_cb,
-                    input_tensor_tile_size,
+                    raw_input_tile_bytes,
                     {.page_id = h * Wt + w, .offset_bytes = 0},
                     {.offset_bytes = 0});
                 noc.async_read_barrier();
@@ -171,7 +179,7 @@ void kernel_main() {
                 noc.async_write(
                     input_tensor_cb,
                     output_tensor_addr_gen,
-                    input_tensor_tile_size,
+                    raw_input_tile_bytes,
                     {.offset_bytes = 0},
                     {.page_id = h * Wt + w, .offset_bytes = 0});
                 noc.async_write_barrier();

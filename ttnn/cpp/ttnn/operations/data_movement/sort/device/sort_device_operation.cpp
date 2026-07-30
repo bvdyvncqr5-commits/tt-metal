@@ -42,7 +42,15 @@ SortDeviceOperation::program_factory_t SortDeviceOperation::select_program_facto
         // Single-core implementation
         return SortProgramFactorySingleRowSingleCore{};
     }
-    if (Wt <= total_number_of_tiles_for_hybrid_approach) {
+    // UINT16 support in the CrossCore factory would require Float32 intermediate,
+    // peer, and rm_value_output CBs (c_4, c_6, c_8, c_13) plus reader/writer
+    // element-wise UInt16↔Float32 conversion loops.  Until that is wired up,
+    // route UINT16 inputs with Wt > SORT_WT_THRESHOLD through the multi-core
+    // DRAM factory, which already has both reader and writer UInt16↔Float32
+    // conversion paths (see SortProgramFactorySingleRowMultiCore and its
+    // dataflow kernels).
+    const bool is_uint16 = (input_dtype == DataType::UINT16);
+    if (!is_uint16 && Wt <= total_number_of_tiles_for_hybrid_approach) {
         // Hybrid implementation
         return SortProgramFactoryCrossCoreDataExchange{};
     }
@@ -79,6 +87,13 @@ void SortDeviceOperation::validate_on_program_cache_miss(
         input.dtype());
 
     const bool is_row_major = (input.layout() == Layout::ROW_MAJOR);
+
+    // UINT16 support: the reader/writer kernels of both the SingleCore and
+    // MultiCore factories perform an element-wise UInt16↔Float32 software
+    // conversion for both TILE and ROW_MAJOR layouts, so any Wt is accepted.
+    // The CrossCore factory does NOT yet include the equivalent conversion;
+    // select_program_factory routes UINT16 with Wt > SORT_WT_THRESHOLD to
+    // MultiCore to work around that.
 
     // Width must be a multiple of 64 regardless of layout.
     // For TILE the relevant dimension is the padded width; for ROW_MAJOR it is

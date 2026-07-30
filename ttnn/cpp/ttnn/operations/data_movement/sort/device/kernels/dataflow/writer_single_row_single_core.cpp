@@ -51,9 +51,14 @@ void kernel_main() {
     // The writer must convert Float32 → UInt16 element-by-element before writing to DRAM.
     constexpr bool is_uint16_fp32_mode =
         get_compile_time_arg_val(value_tensor_args.next_compile_time_args_offset()) == 1;
-    // uint16_conv_cb_index – a 1-tile UInt16 CB used as the conversion staging buffer.
+    // uint16_conv_cb_index – a 1-tile UInt16 CB used as the TILE-path conversion staging buffer.
     constexpr uint32_t uint16_conv_cb_index =
         get_compile_time_arg_val(value_tensor_args.next_compile_time_args_offset() + 1);
+    // rm_uint16_output_stage_cb_index – UInt16 RM staging CB for ROW_MAJOR UINT16 output.
+    // The writer converts Float32 RM rows from rm_value_output_dfb to UInt16 here,
+    // then DMAs W_value_bytes (one UInt16 row) to DRAM.
+    constexpr uint32_t rm_uint16_output_stage_cb_index =
+        get_compile_time_arg_val(value_tensor_args.next_compile_time_args_offset() + 2);
 
     constexpr uint32_t one_tile = 1;
 
@@ -107,6 +112,13 @@ void kernel_main() {
                         __builtin_memcpy(&fval, &fp32_bits, sizeof(fval));
                         u16_ptr[i] = static_cast<uint16_t>(static_cast<uint32_t>(fval));
                     }
+
+                    // Drain the RISC-V store buffer so all uint16 writes reach L1
+                    // before the NoC DMA reads from the same buffer.  Without this
+                    // fence the NoC (a separate L1 client with no program-order
+                    // guarantee with RISC-V stores) may observe stale or partially
+                    // written values.
+                    __sync_synchronize();
 
                     value_tensor_dfb.pop_front(one_tile);
                     conv_dfb.push_back(one_tile);
@@ -166,18 +178,56 @@ void kernel_main() {
                 }
             }
 
-            // Drain 32 sorted RM value rows from rm_value_output_dfb → DRAM
+            // Drain 32 sorted RM value rows from rm_value_output_dfb → DRAM.
+            // For UINT16 inputs rm_value_output_dfb holds Float32 rows; convert
+            // each row to UInt16 via the staging CB before writing to DRAM.
             const uint32_t row_base = h * TILE_H;
-            for (uint32_t row = 0; row < TILE_H; row++) {
-                rm_value_output_dfb.wait_front(one_tile);
-                noc.async_write(
-                    rm_value_output_dfb,
-                    value_accessor,
-                    W_value_bytes,
-                    {.offset_bytes = 0},
-                    {.page_id = row_base + row, .offset_bytes = 0});
-                noc.async_write_barrier();
-                rm_value_output_dfb.pop_front(one_tile);
+            if constexpr (is_uint16_fp32_mode) {
+                DataflowBuffer rm_u16_out_dfb(rm_uint16_output_stage_cb_index);
+                constexpr uint32_t W_elements = W_value_bytes / sizeof(uint16_t);
+                for (uint32_t row = 0; row < TILE_H; row++) {
+                    rm_value_output_dfb.wait_front(one_tile);
+                    rm_u16_out_dfb.reserve_back(one_tile);
+
+                    volatile tt_l1_ptr uint32_t* fp32_src =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rm_value_output_dfb.get_read_ptr());
+                    volatile tt_l1_ptr uint16_t* u16_dst =
+                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rm_u16_out_dfb.get_write_ptr());
+
+                    for (uint32_t i = 0; i < W_elements; i++) {
+                        const uint32_t fp32_bits = fp32_src[i];
+                        float fval;
+                        __builtin_memcpy(&fval, &fp32_bits, sizeof(fval));
+                        u16_dst[i] = static_cast<uint16_t>(static_cast<uint32_t>(fval));
+                    }
+                    // Drain RISC-V store buffer before NoC reads from the same buffer.
+                    __sync_synchronize();
+
+                    rm_value_output_dfb.pop_front(one_tile);
+                    rm_u16_out_dfb.push_back(one_tile);
+
+                    rm_u16_out_dfb.wait_front(one_tile);
+                    noc.async_write(
+                        rm_u16_out_dfb,
+                        value_accessor,
+                        W_value_bytes,
+                        {.offset_bytes = 0},
+                        {.page_id = row_base + row, .offset_bytes = 0});
+                    noc.async_write_barrier();
+                    rm_u16_out_dfb.pop_front(one_tile);
+                }
+            } else {
+                for (uint32_t row = 0; row < TILE_H; row++) {
+                    rm_value_output_dfb.wait_front(one_tile);
+                    noc.async_write(
+                        rm_value_output_dfb,
+                        value_accessor,
+                        W_value_bytes,
+                        {.offset_bytes = 0},
+                        {.page_id = row_base + row, .offset_bytes = 0});
+                    noc.async_write_barrier();
+                    rm_value_output_dfb.pop_front(one_tile);
+                }
             }
         }
     }

@@ -53,6 +53,10 @@ void kernel_main() {
         get_compile_time_arg_val(index_tensor_args.next_compile_time_args_offset()) == 1;
     constexpr uint32_t uint16_input_stage_cb_index =
         get_compile_time_arg_val(index_tensor_args.next_compile_time_args_offset() + 1);
+    // ROW_MAJOR UINT16 staging CB: the reader DMAs one raw UInt16 RM row here,
+    // then converts element-by-element to Float32 and pushes to rm_input_dfb.
+    constexpr uint32_t rm_uint16_input_stage_cb_index =
+        get_compile_time_arg_val(index_tensor_args.next_compile_time_args_offset() + 2);
 
     // Input tensor config
     constexpr uint32_t one_tile = 1;
@@ -163,16 +167,56 @@ void kernel_main() {
             const uint32_t row_base = h * TILE_H;
 
             // --- Read TILE_H input rows into rm_input_dfb ---
-            for (uint32_t row = 0; row < TILE_H; row++) {
-                rm_input_dfb.reserve_back(one_tile);
-                noc.async_read(
-                    input_accessor,
-                    rm_input_dfb,
-                    W_value_bytes,
-                    {.page_id = row_base + row, .offset_bytes = 0},
-                    {.offset_bytes = 0});
-                noc.async_read_barrier();
-                rm_input_dfb.push_back(one_tile);
+            if constexpr (is_uint16_fp32_mode) {
+                // UInt16 ROW_MAJOR path:
+                //   Step 1: DMA one raw UInt16 row (W_value_bytes) into the staging CB.
+                //   Step 2: Convert each uint16 element → float32 in software and push
+                //           the float32 row to rm_input_dfb (Float32 RM CB).
+                DataflowBuffer rm_u16_stage_dfb(rm_uint16_input_stage_cb_index);
+                constexpr uint32_t W_elements = W_value_bytes / sizeof(uint16_t);
+                for (uint32_t row = 0; row < TILE_H; row++) {
+                    rm_u16_stage_dfb.reserve_back(one_tile);
+                    noc.async_read(
+                        input_accessor,
+                        rm_u16_stage_dfb,
+                        W_value_bytes,
+                        {.page_id = row_base + row, .offset_bytes = 0},
+                        {.offset_bytes = 0});
+                    noc.async_read_barrier();
+                    rm_u16_stage_dfb.push_back(one_tile);
+
+                    rm_u16_stage_dfb.wait_front(one_tile);
+                    rm_input_dfb.reserve_back(one_tile);
+
+                    volatile tt_l1_ptr uint16_t* src =
+                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rm_u16_stage_dfb.get_read_ptr());
+                    volatile tt_l1_ptr uint32_t* dst =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(rm_input_dfb.get_write_ptr());
+
+                    for (uint32_t i = 0; i < W_elements; i++) {
+                        float fval = static_cast<float>(static_cast<uint32_t>(src[i]));
+                        uint32_t bits;
+                        __builtin_memcpy(&bits, &fval, sizeof(bits));
+                        dst[i] = bits;
+                    }
+                    // Drain store buffer before the compute kernel reads this row.
+                    __sync_synchronize();
+
+                    rm_u16_stage_dfb.pop_front(one_tile);
+                    rm_input_dfb.push_back(one_tile);
+                }
+            } else {
+                for (uint32_t row = 0; row < TILE_H; row++) {
+                    rm_input_dfb.reserve_back(one_tile);
+                    noc.async_read(
+                        input_accessor,
+                        rm_input_dfb,
+                        W_value_bytes,
+                        {.page_id = row_base + row, .offset_bytes = 0},
+                        {.offset_bytes = 0});
+                    noc.async_read_barrier();
+                    rm_input_dfb.push_back(one_tile);
+                }
             }
 
             // --- Drain TILE_H untilized index rows from rm_index_output_dfb → DRAM ---
