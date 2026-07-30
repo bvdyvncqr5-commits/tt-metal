@@ -202,13 +202,12 @@ FORCE_INLINE bool run_sender_channel_step_speedy(
     }
 
 #if defined(ARCH_BLACKHOLE)
-    // [CRED-PROBE] If this channel is stalled (no free receiver slots, so it just polled completions above
-    // and still can't send), record the absolute completion count we've RECEIVED from the peer. Gated on the
-    // stall so only a stuck channel writes the debug slot -> the stalled channel's value persists. Compared
-    // in the log against the PEER core's RX count, the gap == completion credits lost over the link.
-    if (!outbound_to_receiver_channel_pointers.has_space_for_packet()) {
-        fabric_dbg_set_recvd_completions(*sender_channel_from_receiver_credits.completions_received_counter_ptr);
-    }
+    // [CRED-PROBE] Record the absolute completion count we've RECEIVED from the peer into the debug slot,
+    // EVERY sender step (stall gate removed): the credit-push mode dumps this to the ring buffer on every
+    // context switch, so we want it fresh on ALL cores -- healthy, done, and stalled -- not just stuck ones.
+    // A stalled channel's value naturally freezes (no new completions), so it still persists at the stall
+    // value. Compared in the log against the PEER core's CSENT, the gap == completion credits lost.
+    fabric_dbg_set_recvd_completions(*sender_channel_from_receiver_credits.completions_received_counter_ptr);
 #endif
 
     // Similarly only send back the credit to the worker very infrequently since it's a very
@@ -356,6 +355,15 @@ FORCE_INLINE bool run_receiver_channel_step_speedy(
 
             receiver_state.unacked_sends -= receiver_state.pending_flush_batch_count;
             receiver_state.has_pending_flush = false;
+            // [RECEIVER-SIDE PROBES] Mirror the FULL receiver flow-control state to the debug slots so ERISC0
+            // can push it: BOTH sender-channel completion counters (local_receiver_completion[0]/[1], the L1
+            // block DMA'd to the peer) plus the receiver's local completion_counter. This lets us see exactly
+            // where completions live (which channel, processed-vs-sent) instead of a single ambiguous snapshot.
+            {
+                volatile tt_l1_ptr uint32_t* lrc =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(local_receiver_completion_counters_base_address);
+                fabric_dbg_set_recv_debug(lrc[0], lrc[1], completion_counter.counter);
+            }
         }
     }
 

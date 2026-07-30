@@ -1502,18 +1502,19 @@ void run_routing_without_noc_sync_coordinated_as_master(
         // router stateless and is naturally re-entry safe: the handshake's own internal context switches
         // see the (now-up) link produce no new increment, so they can't recursively trigger another
         // handshake.
-        const uint32_t retrain_count_before = fabric_get_retrain_count();
+        // [HANDSHAKE DISABLED] Post-retrain handshake off (it regresses recovery -> more dead/frozen links,
+        // crowding out the credit-desync tail-stalls we want to capture). Config restore via
+        // run_routing_without_noc_sync() still runs; only the handshake is skipped. Restore the retrain-count
+        // bracket + run_post_retrain_handshake() call to re-enable. INIT handshake CT arg untouched.
         run_routing_without_noc_sync();
-        const uint32_t retrain_count_after = fabric_get_retrain_count();
-        // Count advanced -> a retrain completed this pass. Reconfirm the link is bidirectionally alive HERE
-        // -- inside the context switch, while ERISC1 is held idle by the start/finish coordination, and
-        // BEFORE returning to the main loop -- so no traffic resumes over the fresh link until both ends
-        // handshake.
-        if (retrain_count_after != retrain_count_before) {
-            const auto* routing_table_l1 =
-                reinterpret_cast<tt_l1_ptr tt::tt_fabric::routing_l1_info_t*>(ROUTING_TABLE_BASE);
-            run_post_retrain_handshake(routing_table_l1, termination_signal_ptr);
-        }
+        // const uint32_t retrain_count_before = fabric_get_retrain_count();
+        // run_routing_without_noc_sync();
+        // const uint32_t retrain_count_after = fabric_get_retrain_count();
+        // if (retrain_count_after != retrain_count_before) {
+        //     const auto* routing_table_l1 =
+        //         reinterpret_cast<tt_l1_ptr tt::tt_fabric::routing_l1_info_t*>(ROUTING_TABLE_BASE);
+        //     run_post_retrain_handshake(routing_table_l1, termination_signal_ptr);
+        // }
         coordinated_context_switch_finish_as_master(termination_signal_ptr);
     }
 }

@@ -486,6 +486,25 @@ inline void fabric_dbg_set_recvd_completions([[maybe_unused]] uint32_t v) {
     *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_CRED_RECVD_ADDR) = v;
 #endif
 }
+
+// [RECEIVER-SIDE PROBES] Full receiver-side flow-control state, so we can see exactly where completions
+// live (which channel, and the local completion_counter). All written by ERISC1 (receiver) from the
+// receiver step, read+pushed by ERISC0.
+//   word[4] (+16) = local_receiver_completion_counters[0]  (completions SENT for sender channel 0)
+//   word[5] (+20) = local_receiver_completion_counters[1]  (completions SENT for sender channel 1)
+//   word[6] (+24) = receiver_channel_pointers.completion_counter.counter (local completions PROCESSED)
+// (RX packets received is already tracked at MEM_AERISC_RX_PKT_COUNT_ADDR, word[2].)
+constexpr uint32_t MEM_AERISC_COMPLETION_SENT_ADDR = MEM_AERISC_RESUME_PHASE_BASE + 16;     // LRC ch0
+constexpr uint32_t MEM_AERISC_COMPLETION_SENT1_ADDR = MEM_AERISC_RESUME_PHASE_BASE + 20;    // LRC ch1
+constexpr uint32_t MEM_AERISC_RECV_COMPL_COUNTER_ADDR = MEM_AERISC_RESUME_PHASE_BASE + 24;  // local completion_counter
+inline void fabric_dbg_set_recv_debug(
+    [[maybe_unused]] uint32_t lrc0, [[maybe_unused]] uint32_t lrc1, [[maybe_unused]] uint32_t compl_counter) {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 1)
+    *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_COMPLETION_SENT_ADDR) = lrc0;
+    *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_COMPLETION_SENT1_ADDR) = lrc1;
+    *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RECV_COMPL_COUNTER_ADDR) = compl_counter;
+#endif
+}
 // Push the current TX packet count into the watcher ring buffer. Called on every context switch so the
 // per-core ring buffer becomes a time series of the counter -- if the values keep changing across
 // dumps, TX is advancing; if they flatline, TX has stalled. Replaces the old recovery/link-status
@@ -502,7 +521,10 @@ inline void fabric_dbg_set_recvd_completions([[maybe_unused]] uint32_t v) {
 // (268M); the 100M-packet test is well within range (a 4G-packet budget would overflow the tag).
 constexpr uint32_t FABRIC_DBG_RINGBUF_TX_TAG = 0xA0000000;
 constexpr uint32_t FABRIC_DBG_RINGBUF_RX_TAG = 0xB0000000;
-constexpr uint32_t FABRIC_DBG_RINGBUF_CRED_TAG = 0xC0000000;  // sender's received-completion count
+constexpr uint32_t FABRIC_DBG_RINGBUF_CRED_TAG = 0xC0000000;    // sender's received-completion count
+constexpr uint32_t FABRIC_DBG_RINGBUF_CSENT_TAG = 0xD0000000;   // receiver's sent-completion count, chan 0 (LRC0)
+constexpr uint32_t FABRIC_DBG_RINGBUF_CSENT1_TAG = 0xE0000000;  // receiver's sent-completion count, chan 1 (LRC1)
+constexpr uint32_t FABRIC_DBG_RINGBUF_RXCC_TAG = 0xF0000000;    // receiver's local completion_counter
 constexpr uint32_t FABRIC_DBG_RINGBUF_VALUE_MASK = 0x0FFFFFFF;
 inline void fabric_dbg_ringbuf_push_txrx_counts() {
 #if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
@@ -512,6 +534,73 @@ inline void fabric_dbg_ringbuf_push_txrx_counts() {
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_TX_TAG | (tx & FABRIC_DBG_RINGBUF_VALUE_MASK));
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_RX_TAG | (rx & FABRIC_DBG_RINGBUF_VALUE_MASK));
     WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CRED_TAG | (cred & FABRIC_DBG_RINGBUF_VALUE_MASK));
+#endif
+}
+
+// [CREDIT TIME-SERIES MODE] Push the full flow-control state EVERY context switch (not gated on a stall
+// timeout), so every active link always carries its latest values in the ring buffer. Six tagged entries:
+//   TX   (0xA) = packets sent (sender)
+//   RX   (0xB) = packets received (receiver)
+//   CRED (0xC) = completions RECEIVED by the sender (to_sender_remote_completion, dominant channel)
+//   LRC0 (0xD) = completions SENT by the receiver, sender-channel 0 (local_receiver_completion[0])
+//   LRC1 (0xE) = completions SENT by the receiver, sender-channel 1 (local_receiver_completion[1])
+//   RXCC (0xF) = receiver's local completion_counter (completions PROCESSED)
+// 6 entries -> the 32-slot ring holds ~5 samples; frozen cores keep their last values. Pair endpoints via
+// peers_bh.json. ERISC0-only; reads the receiver slots ERISC1 writes (shared core L1).
+inline void fabric_dbg_ringbuf_push_credits() {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    const uint32_t tx = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_TX_PKT_COUNT_ADDR);
+    const uint32_t rx = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RX_PKT_COUNT_ADDR);
+    const uint32_t cred = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_CRED_RECVD_ADDR);
+    const uint32_t lrc0 = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_COMPLETION_SENT_ADDR);
+    const uint32_t lrc1 = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_COMPLETION_SENT1_ADDR);
+    const uint32_t rxcc = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_RECV_COMPL_COUNTER_ADDR);
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_TX_TAG | (tx & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_RX_TAG | (rx & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CRED_TAG | (cred & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CSENT_TAG | (lrc0 & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CSENT1_TAG | (lrc1 & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_RXCC_TAG | (rxcc & FABRIC_DBG_RINGBUF_VALUE_MASK));
+#endif
+}
+
+// [CREDIT-STALL DUMP MODE] Alternative to fabric_dbg_ringbuf_push_txrx_counts: instead of a per-context-
+// switch TX/RX/CRED time series (which floods the 32-entry ring), this keeps the ring QUIET and only emits
+// a one-shot dump when a core has STOPPED TRANSMITTING (TX frozen) for ~5 minutes. This fires for ANY core
+// whose TX freezes that long -- whether it froze because it STALLED (TX < budget) or COMPLETED (TX at
+// budget). Done cores dumping is intentional: for a one-sided stall (stalled sender + done peer) we need the
+// DONE peer's CSENT (completions it sent to the stalled end) to compute the loss. The dump is the flow-
+// control completion credits; word order in the ring (newest-first) reads [CSENT, CRED, TX, CODE]. Pair the
+// two endpoints of a link via peers_bh.json and compare: receiver CSENT - peer sender CRED == credits lost.
+// A TX=budget dump = a completed core (reference); a TX<budget dump = the stalled core. ERISC0-only (owns TX
+// + does the dump); reads the CSENT slot ERISC1 writes (shared core L1).
+constexpr uint32_t FABRIC_DBG_CREDIT_STALL_CODE = 0x5E5ECD00;  // "credit dump" marker
+// Stall timeout at the 1 GHz eth wall clock (ETH_CLOCK_CYCLE_1MS = 1e6 cycles/ms). Lowered 5min->2min:
+// tail-stalls freeze LATE (~99.99M, ~250s into the run), so a 5-min timeout pushed their dump to ~9 min --
+// right at the capture-window edge. 2 min reliably catches late-freezing tail-stalls. 64-bit: fits.
+constexpr uint64_t FABRIC_DBG_CREDIT_STALL_CYCLES = (uint64_t)2 * 60 * 1000 * ETH_CLOCK_CYCLE_1MS;
+inline void fabric_dbg_credit_stall_check() {
+#if defined(COMPILE_FOR_AERISC) && (PHYSICAL_AERISC_ID == 0)
+    const uint32_t tx = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_TX_PKT_COUNT_ADDR);
+    const uint64_t now = eth_read_wall_clock();
+    static uint32_t last_tx = 0;
+    static uint64_t last_progress = 0;
+    static bool armed = false;  // true once TX has advanced at least once (a core that never sent isn't "stalled")
+    static bool dumped = false;
+    if (tx != last_tx) {
+        last_tx = tx;
+        last_progress = now;
+        armed = (tx > 0);
+        dumped = false;  // re-arm on any progress
+    } else if (armed && !dumped && (now - last_progress) >= FABRIC_DBG_CREDIT_STALL_CYCLES) {
+        dumped = true;
+        const uint32_t cred = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_CRED_RECVD_ADDR);        // recv'd
+        const uint32_t csent = *reinterpret_cast<volatile uint32_t*>(MEM_AERISC_COMPLETION_SENT_ADDR);  // sent
+        WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_CREDIT_STALL_CODE);
+        WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_TX_TAG | (tx & FABRIC_DBG_RINGBUF_VALUE_MASK));
+        WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CRED_TAG | (cred & FABRIC_DBG_RINGBUF_VALUE_MASK));
+        WATCHER_RING_BUFFER_PUSH(FABRIC_DBG_RINGBUF_CSENT_TAG | (csent & FABRIC_DBG_RINGBUF_VALUE_MASK));
+    }
 #endif
 }
 

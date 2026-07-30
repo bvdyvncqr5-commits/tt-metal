@@ -64,11 +64,13 @@ inline __attribute__((always_inline)) void risc_context_switch_without_noc_sync(
     // its shadow counters after. (TEST-ONLY: this makes the "without_noc_sync" path do a full sync.)
     update_boot_results_eth_link_status_check();
     recover_eth_link_if_down();
-    // [TXRX MODE] TX/RX counter time series re-enabled to measure tail-stall / lost-in-flight / frozen with
-    // the post-retrain handshake ENABLED. This floods/evicts the handshake markers (that's expected here --
-    // we're measuring traffic recovery, not debugging the handshake). Comment this out to go back to
-    // handshake-marker debug mode.
-    fabric_dbg_ringbuf_push_txrx_counts();
+    // [CREDIT TIME-SERIES MODE] Push the flow-control credits (TX/CRED/CSENT) EVERY context switch so every
+    // active link always has its latest credits in the ring buffer (no 5-min-timeout gating, no "peer didn't
+    // dump" gaps). Alternatives: fabric_dbg_credit_stall_check() = one-shot dump on a 5-min TX freeze;
+    // fabric_dbg_ringbuf_push_txrx_counts() = TX/RX time series.
+    fabric_dbg_ringbuf_push_credits();
+    // fabric_dbg_credit_stall_check();
+    // fabric_dbg_ringbuf_push_txrx_counts();
 #endif
 #endif
 }
