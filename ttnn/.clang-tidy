@@ -1,2 +1,0 @@
-InheritParentConfig: true
-Checks: -bugprone-suspicious-stringview-data-usage, -misc-use-anonymous-namespace, -readability-avoid-nested-conditional-operator

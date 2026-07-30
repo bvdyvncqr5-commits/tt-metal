@@ -1,1 +1,0 @@
-../../sfpi-info.sh

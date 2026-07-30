@@ -1,1 +1,0 @@
-../../wormhole/tests/test_perf.py

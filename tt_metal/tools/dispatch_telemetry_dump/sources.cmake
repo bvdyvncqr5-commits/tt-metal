@@ -1,1 +1,0 @@
-set(DISPATCH_TELEMETRY_DUMP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_telemetry_dump.cpp)

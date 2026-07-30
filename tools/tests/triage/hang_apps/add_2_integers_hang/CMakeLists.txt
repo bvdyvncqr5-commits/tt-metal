@@ -1,3 +1,0 @@
-add_executable(triage_hang_app_add_2_integers_hang)
-target_sources(triage_hang_app_add_2_integers_hang PRIVATE add_2_integers_hang.cpp)
-target_link_libraries(triage_hang_app_add_2_integers_hang PUBLIC TT::Metalium)

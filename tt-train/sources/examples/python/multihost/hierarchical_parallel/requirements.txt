@@ -1,7 +1,0 @@
-datasets
-transformers
-tqdm
-numpy
-loguru
-pydantic
-ml_dtypes

@@ -1,2 +1,0 @@
-InheritParentConfig: true
-Checks: misc-unused-parameters, -readability-static-accessed-through-instance
