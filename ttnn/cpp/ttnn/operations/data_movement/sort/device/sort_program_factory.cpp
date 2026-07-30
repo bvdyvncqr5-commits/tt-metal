@@ -28,7 +28,6 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
     const tt::DataFormat index_tensor_cb_data_format = datatype_to_dataformat_converter(output_tensors.at(1).dtype());
 
     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
-    const uint32_t value_tensor_tile_size = tile_size(value_tensor_cb_data_format);
     const uint32_t index_tensor_tile_size = tile_size(index_tensor_cb_data_format);
 
     auto* input_buffer = tensor_args.input_tensor.buffer();
@@ -56,7 +55,21 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
     const uint32_t all_core_utilization_loop_residuum = Ht % total_number_of_cores;
 
     const bool is_32_bit_index = index_tensor_cb_data_format == tt::DataFormat::UInt32;
-    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32;
+    // UINT16 keys must also run in fp32_dest_acc_en mode so the SFPU compares
+    // them as 32-bit floats.  The hardware unpack converts the uint16 integer
+    // value to an exact float32 (all 0..65535 are representable in 24-bit
+    // mantissa), avoiding the bf16 precision loss that collapses integers > 256.
+    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32 ||
+                                input_tensor_cb_data_format == tt::DataFormat::UInt16;
+
+    // With fp32_dest_acc_en=True, pack_tile writes 32-bit floats. Intermediate value CBs
+    // (c_2 transposed input, c_4 sorted output) must use Float32 so that fp32 values
+    // from the DEST register are stored and read back without truncation. The writer then
+    // converts Float32 → UInt16 element-by-element when sending to DRAM.
+    const bool is_uint16_input = (input_tensor_cb_data_format == tt::DataFormat::UInt16);
+    const tt::DataFormat sort_value_cb_data_format =
+        is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
+    const uint32_t sort_value_tile_size = tile_size(sort_value_cb_data_format);
 
     CoreRangeSet core_range;
     if (Ht >= total_number_of_cores) {
@@ -84,6 +97,16 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
 
     ProgramDescriptor desc;
 
+    // When the input is UInt16 the hardware unpack cannot convert UInt16 → Float32
+    // (UInt16 can only unpack to UInt16 destination per the ISA spec).  Instead the
+    // reader kernel does a software UInt16 → Float32 conversion on the RISC-V core:
+    //   1. DMA the raw UInt16 tile from DRAM into a small staging CB (c_12, UInt16).
+    //   2. Loop over elements and emit float(uint16_val) into c_0 (Float32).
+    // The compute kernel then sees correct Float32 values and sorts them exactly.
+    // When not UInt16, c_0 keeps its original format and the staging CB is a no-op stub.
+    const tt::DataFormat input_cb_data_format = is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
+    const uint32_t input_cb_tile_size = is_uint16_input ? sort_value_tile_size : input_tensor_tile_size;
+
     // -----------------------------------------------------------------------
     // Circular buffers
     // -----------------------------------------------------------------------
@@ -91,12 +114,12 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
     {
         const uint32_t cb0_tiles = is_row_major ? Wt : cb_in_units;
         desc.cbs.push_back(CBDescriptor{
-            .total_size = cb0_tiles * input_tensor_tile_size,
+            .total_size = cb0_tiles * input_cb_tile_size,
             .core_ranges = core_range,
             .format_descriptors = {{CBFormatDescriptor{
                 .buffer_index = static_cast<uint8_t>(input_tensor_cb_index),
-                .data_format = input_tensor_cb_data_format,
-                .page_size = input_tensor_tile_size,
+                .data_format = input_cb_data_format,
+                .page_size = input_cb_tile_size,
             }}},
         });
     }
@@ -117,12 +140,12 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
 
     constexpr uint32_t input_tensor_transposed_cb_index = tt::CBIndex::c_2;
     desc.cbs.push_back(CBDescriptor{
-        .total_size = Wt * input_tensor_tile_size,
+        .total_size = Wt * sort_value_tile_size,
         .core_ranges = core_range,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = static_cast<uint8_t>(input_tensor_transposed_cb_index),
-            .data_format = input_tensor_cb_data_format,
-            .page_size = input_tensor_tile_size,
+            .data_format = sort_value_cb_data_format,
+            .page_size = sort_value_tile_size,
         }}},
     });
 
@@ -139,12 +162,12 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
 
     constexpr uint32_t value_tensor_cb_index = tt::CBIndex::c_4;
     desc.cbs.push_back(CBDescriptor{
-        .total_size = num_cb_unit * value_tensor_tile_size,
+        .total_size = num_cb_unit * sort_value_tile_size,
         .core_ranges = core_range,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = static_cast<uint8_t>(value_tensor_cb_index),
-            .data_format = value_tensor_cb_data_format,
-            .page_size = value_tensor_tile_size,
+            .data_format = sort_value_cb_data_format,
+            .page_size = sort_value_tile_size,
         }}},
     });
 
@@ -222,6 +245,41 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
         });
     }
 
+    // UInt16 conversion CB: writer reads Float32 sorted values from c_4 and uses this
+    // single-tile UInt16 CB as an intermediate buffer to convert Float32 → UInt16 before
+    // DMA'ing to DRAM.  Allocated for all inputs so the writer can reference c_11 via
+    // get_tile_size() at compile time regardless of input dtype.
+    constexpr uint32_t uint16_conv_cb_index = tt::CBIndex::c_11;
+    {
+        const uint32_t uint16_one_tile_size = tile_size(tt::DataFormat::UInt16);
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = uint16_one_tile_size,
+            .core_ranges = core_range,
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(uint16_conv_cb_index),
+                .data_format = tt::DataFormat::UInt16,
+                .page_size = uint16_one_tile_size,
+            }}},
+        });
+    }
+
+    // UInt16 INPUT staging CB: reader DMAs raw UInt16 tiles here (2048 bytes), then the
+    // RISC-V loop converts each element to Float32 and pushes into c_0 (Float32 CB).
+    // Always allocated (1 tile) so the reader can call get_tile_size(c_12) unconditionally.
+    constexpr uint32_t uint16_input_stage_cb_index = tt::CBIndex::c_12;
+    {
+        const uint32_t uint16_one_tile_size = tile_size(tt::DataFormat::UInt16);
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = uint16_one_tile_size,
+            .core_ranges = core_range,
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(uint16_input_stage_cb_index),
+                .data_format = tt::DataFormat::UInt16,
+                .page_size = uint16_one_tile_size,
+            }}},
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Kernels
     // -----------------------------------------------------------------------
@@ -241,6 +299,8 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
     };
     TensorAccessorArgs(*input_buffer).append_to(reader_compile_time_args);
     TensorAccessorArgs(*index_buffer).append_to(reader_compile_time_args);
+    reader_compile_time_args.push_back(static_cast<uint32_t>(is_uint16_input));
+    reader_compile_time_args.push_back(uint16_input_stage_cb_index);
 
     KernelDescriptor reader_desc;
     reader_desc.kernel_source =
@@ -264,6 +324,8 @@ ProgramDescriptor SortProgramFactorySingleRowSingleCore::create_descriptor(
         W_value_bytes,
     };
     TensorAccessorArgs(*value_buffer).append_to(writer_compile_time_args);
+    writer_compile_time_args.push_back(static_cast<uint32_t>(is_uint16_input));
+    writer_compile_time_args.push_back(uint16_conv_cb_index);
 
     KernelDescriptor writer_desc;
     writer_desc.kernel_source =
@@ -539,7 +601,20 @@ ProgramDescriptor build_cross_core_program_descriptor(
 
     // uint32 index tensor support
     const bool is_32_bit_index = index_tensor_cb_data_format == tt::DataFormat::UInt32;
-    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32;
+    // UINT16 keys must also run in fp32_dest_acc_en mode so the SFPU compares
+    // them as 32-bit floats.  See comment in SortProgramFactorySingleRowSingleCore
+    // for the full rationale.
+    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32 ||
+                                input_tensor_cb_data_format == tt::DataFormat::UInt16;
+
+    // TODO(#46331): The CrossCoreDataExchange path requires additional Float32 intermediate
+    // CB changes (and writer Float32→UInt16 conversion) that are not yet implemented.
+    // For now the select_program_factory logic already routes small Wt to
+    // SortProgramFactorySingleRowSingleCore, so UINT16 sort of small tensors is covered.
+    TT_FATAL(
+        input_tensor_cb_data_format != tt::DataFormat::UInt16,
+        "UINT16 dtype is not yet supported in the CrossCore sort factory. "
+        "Use tensors where the last dim fits within the SingleCore threshold.");
 
     const bool is_row_major = (tensor_args.input_tensor.layout() == Layout::ROW_MAJOR);
     const auto tile_width = tensor_args.input_tensor.tensor_spec().tile().get_width();
@@ -970,11 +1045,9 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
     const SortParams& attributes, const SortInputs& tensor_args, std::vector<Tensor>& output_tensors) {
     const tt::DataFormat input_tensor_cb_data_format =
         datatype_to_dataformat_converter(tensor_args.input_tensor.dtype());
-    const tt::DataFormat value_tensor_cb_data_format = datatype_to_dataformat_converter(output_tensors.at(0).dtype());
     const tt::DataFormat index_tensor_cb_data_format = datatype_to_dataformat_converter(output_tensors.at(1).dtype());
 
     const uint32_t input_tensor_tile_size = tile_size(input_tensor_cb_data_format);
-    const uint32_t value_tensor_tile_size = tile_size(value_tensor_cb_data_format);
     const uint32_t index_tensor_tile_size = tile_size(index_tensor_cb_data_format);
 
     auto* const input_buffer = tensor_args.input_tensor.buffer();
@@ -1004,7 +1077,16 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
     const uint32_t all_core_utilization_loop_count = total_work_units / number_of_available_cores;
 
     const bool is_32_bit_index = index_tensor_cb_data_format == tt::DataFormat::UInt32;
-    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32;
+    // UINT16 keys must also run in fp32_dest_acc_en mode so the SFPU compares
+    // them as 32-bit floats.  See comment in SortProgramFactorySingleRowSingleCore
+    // for the full rationale.
+    const bool is_32_bit_data = is_32_bit_index || input_tensor_cb_data_format == tt::DataFormat::Float32 ||
+                                input_tensor_cb_data_format == tt::DataFormat::UInt16;
+
+    const bool is_uint16_input = (input_tensor_cb_data_format == tt::DataFormat::UInt16);
+    const tt::DataFormat sort_value_cb_data_format =
+        is_uint16_input ? tt::DataFormat::Float32 : input_tensor_cb_data_format;
+    const uint32_t sort_value_tile_size = tile_size(sort_value_cb_data_format);
 
     const uint32_t log2Wt = std::log2(Wt);
 
@@ -1068,12 +1150,12 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
 
     constexpr uint32_t input_tensor_transposed_cb_index = tt::CBIndex::c_2;
     desc.cbs.push_back(CBDescriptor{
-        .total_size = buffer_scale_factor * input_tensor_tile_size,
+        .total_size = buffer_scale_factor * sort_value_tile_size,
         .core_ranges = all_core_set,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = static_cast<uint8_t>(input_tensor_transposed_cb_index),
-            .data_format = input_tensor_cb_data_format,
-            .page_size = input_tensor_tile_size,
+            .data_format = sort_value_cb_data_format,
+            .page_size = sort_value_tile_size,
         }}},
     });
 
@@ -1090,12 +1172,12 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
 
     constexpr uint32_t input_tensor_output_cb_index = tt::CBIndex::c_4;
     desc.cbs.push_back(CBDescriptor{
-        .total_size = buffer_scale_factor * value_tensor_tile_size,
+        .total_size = buffer_scale_factor * sort_value_tile_size,
         .core_ranges = all_core_set,
         .format_descriptors = {{CBFormatDescriptor{
             .buffer_index = static_cast<uint8_t>(input_tensor_output_cb_index),
-            .data_format = value_tensor_cb_data_format,
-            .page_size = value_tensor_tile_size,
+            .data_format = sort_value_cb_data_format,
+            .page_size = sort_value_tile_size,
         }}},
     });
 
@@ -1175,6 +1257,21 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
                 .buffer_index = static_cast<uint8_t>(rm_worker_output_index_cb_index),
                 .data_format = index_tensor_cb_data_format,
                 .page_size = W_index_bytes,
+            }}},
+        });
+    }
+
+    // UInt16 conversion CB: same purpose as in SortProgramFactorySingleRowSingleCore.
+    constexpr uint32_t uint16_conv_cb_index = tt::CBIndex::c_10;
+    {
+        const uint32_t uint16_one_tile_size = tile_size(tt::DataFormat::UInt16);
+        desc.cbs.push_back(CBDescriptor{
+            .total_size = uint16_one_tile_size,
+            .core_ranges = all_core_set,
+            .format_descriptors = {{CBFormatDescriptor{
+                .buffer_index = static_cast<uint8_t>(uint16_conv_cb_index),
+                .data_format = tt::DataFormat::UInt16,
+                .page_size = uint16_one_tile_size,
             }}},
         });
     }
@@ -1300,6 +1397,8 @@ ProgramDescriptor SortProgramFactorySingleRowMultiCore::create_descriptor(
     writer_compile_time_args.push_back(static_cast<uint32_t>(rm_worker_output_index_cb_index));
     writer_compile_time_args.push_back(W_tile_bytes);
     writer_compile_time_args.push_back(W_index_bytes);
+    writer_compile_time_args.push_back(static_cast<uint32_t>(is_uint16_input));
+    writer_compile_time_args.push_back(uint16_conv_cb_index);
 
     KernelDescriptor writer_desc;
     writer_desc.kernel_source =

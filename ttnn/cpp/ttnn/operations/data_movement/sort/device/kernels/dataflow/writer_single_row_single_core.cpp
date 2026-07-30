@@ -45,6 +45,16 @@ void kernel_main() {
 
     constexpr auto value_tensor_args = TensorAccessorArgs<11>();
 
+    // New args appended after TensorAccessorArgs:
+    // is_uint16_fp32_mode – set when input dtype is UINT16. In this mode the sort compute
+    // kernel writes sorted values as Float32 (into c_4) to avoid bf16 packing corruption.
+    // The writer must convert Float32 → UInt16 element-by-element before writing to DRAM.
+    constexpr bool is_uint16_fp32_mode =
+        get_compile_time_arg_val(value_tensor_args.next_compile_time_args_offset()) == 1;
+    // uint16_conv_cb_index – a 1-tile UInt16 CB used as the conversion staging buffer.
+    constexpr uint32_t uint16_conv_cb_index =
+        get_compile_time_arg_val(value_tensor_args.next_compile_time_args_offset() + 1);
+
     constexpr uint32_t one_tile = 1;
 
     // TensorAccessor handles both interleaved and sharded buffers natively.
@@ -56,6 +66,7 @@ void kernel_main() {
     DataflowBuffer value_tensor_dfb(value_tensor_cb_index);
     DataflowBuffer rm_value_output_dfb(rm_value_output_dfb_index);
     constexpr uint32_t value_tensor_tile_size = get_tile_size(value_tensor_cb_index);
+    constexpr uint32_t uint16_tile_size = get_tile_size(uint16_conv_cb_index);
 
     if constexpr (!is_row_major) {
         for (uint32_t core_loop = 0; core_loop < core_loop_count; core_loop++) {
@@ -71,17 +82,59 @@ void kernel_main() {
                 }
             }
 
-            // Write sorted value tiles from value_tensor_dfb → DRAM
-            for (uint32_t w = 0; w < Wt; w++) {
-                value_tensor_dfb.wait_front(one_tile);
-                noc.async_write(
-                    value_tensor_dfb,
-                    value_accessor,
-                    value_tensor_tile_size,
-                    {.offset_bytes = 0},
-                    {.page_id = h * Wt + w, .offset_bytes = 0});
-                noc.async_write_barrier();
-                value_tensor_dfb.pop_front(one_tile);
+            if constexpr (is_uint16_fp32_mode) {
+                // The compute kernel stored sorted values as Float32 in value_tensor_cb (c_4).
+                // Convert each Float32 element back to UInt16 using a staging CB, then DMA.
+                // This avoids the bf16-truncation bug that pack_tile would cause when packing
+                // a fp32 DEST register to a UInt16 circular buffer.
+                DataflowBuffer conv_dfb(uint16_conv_cb_index);
+                constexpr uint32_t ELEMENTS_PER_TILE = 1024;  // 32×32
+
+                for (uint32_t w = 0; w < Wt; w++) {
+                    value_tensor_dfb.wait_front(one_tile);
+                    conv_dfb.reserve_back(one_tile);
+
+                    // Float32 source pointer (4 bytes per element)
+                    volatile tt_l1_ptr uint32_t* fp32_ptr =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(value_tensor_dfb.get_read_ptr());
+                    // UInt16 destination pointer (2 bytes per element)
+                    volatile tt_l1_ptr uint16_t* u16_ptr =
+                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(conv_dfb.get_write_ptr());
+
+                    for (uint32_t i = 0; i < ELEMENTS_PER_TILE; i++) {
+                        const uint32_t fp32_bits = fp32_ptr[i];
+                        float fval;
+                        __builtin_memcpy(&fval, &fp32_bits, sizeof(fval));
+                        u16_ptr[i] = static_cast<uint16_t>(static_cast<uint32_t>(fval));
+                    }
+
+                    value_tensor_dfb.pop_front(one_tile);
+                    conv_dfb.push_back(one_tile);
+
+                    // DMA the converted UInt16 tile to DRAM using the standard accessor API.
+                    conv_dfb.wait_front(one_tile);
+                    noc.async_write(
+                        conv_dfb,
+                        value_accessor,
+                        uint16_tile_size,
+                        {.offset_bytes = 0},
+                        {.page_id = h * Wt + w, .offset_bytes = 0});
+                    noc.async_write_barrier();
+                    conv_dfb.pop_front(one_tile);
+                }
+            } else {
+                // Write sorted value tiles from value_tensor_dfb → DRAM
+                for (uint32_t w = 0; w < Wt; w++) {
+                    value_tensor_dfb.wait_front(one_tile);
+                    noc.async_write(
+                        value_tensor_dfb,
+                        value_accessor,
+                        value_tensor_tile_size,
+                        {.offset_bytes = 0},
+                        {.page_id = h * Wt + w, .offset_bytes = 0});
+                    noc.async_write_barrier();
+                    value_tensor_dfb.pop_front(one_tile);
+                }
             }
         }
     } else {

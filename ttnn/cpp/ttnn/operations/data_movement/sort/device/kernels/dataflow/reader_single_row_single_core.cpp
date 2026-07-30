@@ -44,6 +44,16 @@ void kernel_main() {
     constexpr auto input_tensor_args = TensorAccessorArgs<12>();
     constexpr auto index_tensor_args = TensorAccessorArgs<input_tensor_args.next_compile_time_args_offset()>();
 
+    // UINT16 input mode: the hardware unpack cannot numerically convert UInt16 → Float32
+    // (ISA spec only allows UInt16 → UInt16 destination).  Instead the reader kernel does
+    // a software conversion on the RISC-V core: DMA the raw UInt16 tile into a staging CB
+    // (c_12) and then emit float(uint16_val) element-by-element into c_0 (Float32 CB).
+    // The compute kernel then sees correct Float32 values and sorts them exactly.
+    constexpr bool is_uint16_fp32_mode =
+        get_compile_time_arg_val(index_tensor_args.next_compile_time_args_offset()) == 1;
+    constexpr uint32_t uint16_input_stage_cb_index =
+        get_compile_time_arg_val(index_tensor_args.next_compile_time_args_offset() + 1);
+
     // Input tensor config
     constexpr uint32_t one_tile = 1;
 
@@ -60,6 +70,8 @@ void kernel_main() {
     DataflowBuffer rm_index_output_dfb(rm_index_output_dfb_index);
     constexpr uint32_t input_tensor_tile_size = get_tile_size(input_tensor_cb_index);
     constexpr uint32_t index_tensor_tile_size = get_tile_size(index_tensor_output_cb_index);
+    constexpr uint32_t uint16_stage_tile_size = get_tile_size(uint16_input_stage_cb_index);
+    constexpr uint32_t ELEMENTS_PER_TILE = 1024;  // 32×32
 
     if constexpr (!is_row_major) {
         for (uint32_t core_loop = 0; core_loop < core_loop_count; core_loop++) {
@@ -67,16 +79,52 @@ void kernel_main() {
                                get_absolute_logical_y() * compute_with_storage_grid_size_x + get_absolute_logical_x();
 
             // Read input tiles from DRAM → tile input CB
-            for (uint32_t w = 0; w < Wt; w++) {
-                input_tensor_dfb.reserve_back(one_tile);
-                noc.async_read(
-                    input_accessor,
-                    input_tensor_dfb,
-                    input_tensor_tile_size,
-                    {.page_id = h * Wt + w, .offset_bytes = 0},
-                    {.offset_bytes = 0});
-                noc.async_read_barrier();
-                input_tensor_dfb.push_back(one_tile);
+            if constexpr (is_uint16_fp32_mode) {
+                // Step 1: DMA raw UInt16 tile from DRAM into staging CB (c_12, UInt16 format).
+                // Step 2: RISC-V software converts each uint16 → float32 exactly and writes
+                //         the float32 tile into c_0 (Float32 CB) for the compute kernel.
+                DataflowBuffer uint16_stage_dfb(uint16_input_stage_cb_index);
+                for (uint32_t w = 0; w < Wt; w++) {
+                    uint16_stage_dfb.reserve_back(one_tile);
+                    noc.async_read(
+                        input_accessor,
+                        uint16_stage_dfb,
+                        uint16_stage_tile_size,
+                        {.page_id = h * Wt + w, .offset_bytes = 0},
+                        {.offset_bytes = 0});
+                    noc.async_read_barrier();
+                    uint16_stage_dfb.push_back(one_tile);
+
+                    uint16_stage_dfb.wait_front(one_tile);
+                    input_tensor_dfb.reserve_back(one_tile);
+
+                    volatile tt_l1_ptr uint16_t* src =
+                        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(uint16_stage_dfb.get_read_ptr());
+                    volatile tt_l1_ptr uint32_t* dst =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(input_tensor_dfb.get_write_ptr());
+
+                    for (uint32_t i = 0; i < ELEMENTS_PER_TILE; i++) {
+                        float fval = static_cast<float>(static_cast<uint32_t>(src[i]));
+                        uint32_t bits;
+                        __builtin_memcpy(&bits, &fval, sizeof(bits));
+                        dst[i] = bits;
+                    }
+
+                    uint16_stage_dfb.pop_front(one_tile);
+                    input_tensor_dfb.push_back(one_tile);
+                }
+            } else {
+                for (uint32_t w = 0; w < Wt; w++) {
+                    input_tensor_dfb.reserve_back(one_tile);
+                    noc.async_read(
+                        input_accessor,
+                        input_tensor_dfb,
+                        input_tensor_tile_size,
+                        {.page_id = h * Wt + w, .offset_bytes = 0},
+                        {.offset_bytes = 0});
+                    noc.async_read_barrier();
+                    input_tensor_dfb.push_back(one_tile);
+                }
             }
 
             // Write sorted index tiles from index output CB → DRAM
