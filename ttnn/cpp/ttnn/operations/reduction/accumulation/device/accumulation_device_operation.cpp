@@ -50,6 +50,13 @@ void AccumulationDeviceOperation::validate_on_program_cache_miss(
         "The provided input tensor has a non-tile layout: {}.",
         enchantum::to_string(input_tensor.layout()));
 
+    // UInt16 is unpacked through SrcA into the 32-bit Dest that the integer add / multiply read as its low 16 bits,
+    // so the result came back as zeros (#58150); UInt8 does not build. Reject both instead of returning zeros.
+    TT_FATAL(
+        input_tensor.dtype() != DataType::UINT16 && input_tensor.dtype() != DataType::UINT8,
+        "ttnn accumulation operations (cumprod, cumsum) do not support {} input; use INT32 or UINT32.",
+        enchantum::to_string(input_tensor.dtype()));
+
     TT_FATAL(
         input_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
         "ttnn accumulation operations (cumprod, cumsum) require the memory layout of the input tensor to be "

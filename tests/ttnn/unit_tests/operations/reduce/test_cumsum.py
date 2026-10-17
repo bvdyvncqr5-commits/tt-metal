@@ -418,3 +418,14 @@ def test_cumsum_bf16_accuracy(size, dim, sequence_type, reverse_order, device):
 
     assert output.dtype == torch.bfloat16
     assert_with_ulp(expected_result=expected, actual_result=output, ulp_threshold=1)
+
+
+@pytest.mark.parametrize("op", ["cumsum", "cumprod"])
+@pytest.mark.parametrize("dtype", [ttnn.uint16, ttnn.uint8])
+def test_accumulation_rejects_uint16_and_uint8(device, op, dtype):
+    # UInt16 used to return all zeros and UInt8 failed in the kernel build (#58150); both are rejected up front now.
+    input_tensor = ttnn.from_torch(
+        torch.ones((32, 32), dtype=torch.int32), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    with pytest.raises(RuntimeError, match="do not support"):
+        getattr(ttnn, op)(input_tensor, dim=-1)
