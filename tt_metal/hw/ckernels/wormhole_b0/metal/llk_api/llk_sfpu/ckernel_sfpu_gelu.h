@@ -305,7 +305,8 @@ inline void calculate_gelu() {
 #pragma GCC unroll 0
         for (int d = 0; d < ITERATIONS; d++) {
             sfpi::vFloat x = sfpi::dst_reg[0];
-            sfpi::vFloat result = 0.0f;  // default 0 for x <= GELU_SAT
+            // Lanes failing x > GELU_SAT: finite x -> +0; -inf and a negative NaN (fails the compare) -> NaN
+            sfpi::vFloat result = x - x;
             v_if(x > GELU_SAT) {
                 sfpi::vFloat scaled = x * INV_SQRT2;
                 scaled = sfpi::min(scaled, 10.0f);

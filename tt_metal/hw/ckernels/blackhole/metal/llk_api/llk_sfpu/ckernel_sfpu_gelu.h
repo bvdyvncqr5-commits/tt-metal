@@ -302,17 +302,19 @@ inline void calculate_gelu() {
         // unroll 8 fills the SFPU pipeline across 8 independent dst-tile chains.
         constexpr float INV_SQRT2 = 0.7071067811865475f;
         constexpr float GELU_SAT = -5.54259443f;  // 0xc0b15cef: first x where libm erff=-1.0
+        constexpr float GELU_SAT_SCALED = GELU_SAT * INV_SQRT2;
 #pragma GCC unroll 0
         for (int d = 0; d < ITERATIONS; d++) {
             sfpi::vFloat x = sfpi::dst_reg[0];
             sfpi::vFloat result = 0.0f;  // default 0 for x <= GELU_SAT
-            v_if(x > GELU_SAT) {
-                sfpi::vFloat scaled = x * INV_SQRT2;
-                scaled = sfpi::min(scaled, 10.0f);
-                sfpi::vFloat x2 = scaled * scaled;
+            // Same region as x > GELU_SAT for every number; the multiply returns any NaN as +NaN, which
+            // passes the compare and propagates (x > GELU_SAT sorts a negative NaN below -inf, giving 0)
+            sfpi::vFloat scaled = x * INV_SQRT2;
+            v_if(scaled > GELU_SAT_SCALED) {
+                sfpi::vFloat s = sfpi::min(scaled, 10.0f);
+                sfpi::vFloat x2 = s * s;
                 sfpi::vFloat erf_n, erf_d;
-                piecewise_rational_eval_parity_numer_denom<16, 16>(
-                    GELU_ERF_NUM, GELU_ERF_DEN, scaled, x2, erf_n, erf_d);
+                piecewise_rational_eval_parity_numer_denom<16, 16>(GELU_ERF_NUM, GELU_ERF_DEN, s, x2, erf_n, erf_d);
                 sfpi::vFloat erf_val = erf_n * sfpu_reciprocal<false>(erf_d);
                 erf_val = sfpi::clamp(erf_val, -1.0f, 1.0f);
                 result = x * (0.5f + 0.5f * erf_val);

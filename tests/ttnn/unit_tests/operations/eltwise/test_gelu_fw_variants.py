@@ -292,6 +292,30 @@ def test_gelu_inf_nan_handling(device, variant_name, torch_dtype, tt_dtype):
         assert val == 0.0 or not math.isfinite(val), f"{variant_name}: {name} -> {val!r}, expected 0 or any non-finite"
 
 
+def test_gelu_accurate_fp32_nan_sign_and_saturation(device):
+    """FP32 accurate mode: a NaN of either sign returns NaN, -inf returns 0 or NaN,
+    and finite inputs below the saturation point still return +0."""
+    special = [0xFFC00000, 0xFF800001, 0xFFFFFFFF, 0x7FC00000, 0x7F800001, 0x7FFFFFFF, 0xFF800000]
+    row = torch.tensor([b - (1 << 32) if b & 0x80000000 else b for b in special], dtype=torch.int32)
+    saturated = torch.tensor([-5.6, -6.0, -13.375, -100.0, -1.0e30, -3.0e38], dtype=torch.float32)
+    row = torch.cat([row, saturated.view(torch.int32)])
+    bits = torch.zeros((32, 32), dtype=torch.int32)
+    for r in range(32):  # shift each row by one more column so every value lands in all four faces
+        bits[r, (torch.arange(len(row)) + r + 1) % 32] = row
+    inputs = bits.view(torch.float32)
+    tt_input = ttnn.from_torch(
+        inputs, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device, preserve_nan_values=True
+    )
+    out = ttnn.to_torch(ttnn.gelu(tt_input, variant=ttnn.GeluVariant.Accurate))
+
+    nan_in = torch.isnan(inputs)
+    assert torch.isnan(out[nan_in]).all(), f"NaN inputs gave {out[nan_in & ~torch.isnan(out)][:4].tolist()}"
+    neg_inf = out[inputs == float("-inf")]
+    assert ((neg_inf == 0) | torch.isnan(neg_inf)).all(), f"gelu(-inf) -> {neg_inf.unique().tolist()}"
+    sat_out = out[torch.isfinite(inputs) & (inputs <= -5.6)]
+    assert (sat_out == 0).all() and not torch.signbit(sat_out).any(), f"saturated: {sat_out.unique().tolist()}"
+
+
 def test_gelu_tanh_fast_param_matches_tanh(device):
     """GELU_TANH with param 1 (x / (1 + exp(-2u))) through the generic unary path, over every finite BF16 input,
     against variant=Tanh: <= 1 BF16 ULP where |GELU| >= 1e-3. In the negative tail the accurate path cancels
