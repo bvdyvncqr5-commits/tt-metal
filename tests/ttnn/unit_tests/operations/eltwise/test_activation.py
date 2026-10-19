@@ -186,6 +186,56 @@ def test_scalarB_celu(device, h, w, alpha, torch_dtype, ttnn_dtype):
         assert_with_ulp(expected_result=torch_output_tensor, actual_result=output_tensor, ulp_threshold=2)
 
 
+@pytest.mark.parametrize("alpha", [-1.0, -4.0, -0.5])
+@pytest.mark.parametrize(
+    "torch_dtype,ttnn_dtype",
+    [(torch.float32, ttnn.float32), (torch.bfloat16, ttnn.bfloat16)],
+)
+def test_celu_negative_alpha_large_ratio(device, alpha, torch_dtype, ttnn_dtype):
+    if device.arch() == ttnn.device.Arch.QUASAR:
+        pytest.skip("Quasar's own celu / expm1 copy has the same alpha < 0 overflow and is not changed here")
+    # x / alpha around ln(FLT_MAX) = 88.72 and far past it, NaN / +-inf, and tiny negative x where
+    # celu(x) rounds to x. Power-of-two alphas keep x / alpha exact on host and device.
+    ratio = torch.cat(
+        [
+            torch.linspace(0.0, 200.0, 4096, dtype=torch.float64),
+            torch.linspace(87.5, 90.5, 4096 - 8, dtype=torch.float64),
+            # inf, NaN, -inf, 0, and the first float32 above ln(FLT_MAX)
+            torch.tensor([float("inf"), float("nan"), -float("inf"), 0.0, 88.72283935546875], dtype=torch.float64),
+        ]
+    )
+    tiny = torch.tensor([-1.2e-38, -2e-38, -5e-38], dtype=torch.float64) * max(abs(alpha), 1.0)
+    torch_input_tensor_a = torch.cat([ratio * alpha, tiny]).to(torch_dtype).reshape(64, 128)
+    # torch overflows expm1 itself past 88.72, so for |alpha| < 1 the golden is -inf there too
+    golden_function = ttnn.get_golden_function(ttnn.celu)
+    torch_output_tensor = golden_function(torch_input_tensor_a, alpha=alpha)
+
+    input_tensor_a = ttnn.from_torch(torch_input_tensor_a, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    output_tensor = ttnn.to_torch(ttnn.celu(input_tensor_a, alpha=alpha))
+
+    nan_in = torch.isnan(torch_input_tensor_a)
+    if torch_dtype == torch.float32:
+        assert torch.isnan(output_tensor[nan_in]).all()
+    else:  # a bfloat16 Dest stores a NaN as an infinity (tenstorrent/tt-llk#675)
+        assert not torch.isfinite(output_tensor[nan_in]).any()
+    assert not torch.isnan(output_tensor[~nan_in]).any(), "NaN from a non-NaN input"
+
+    # x / alpha in [88.37, 88.7229]: k capped at 127, about 1e-5 relative in float32; at 88.72283935546875
+    # torch's expm1 overflows while the kernel returns alpha * (largest finite float)
+    ratio_in = torch_input_tensor_a.double() / alpha
+    band = (ratio_in > 88.37) & (ratio_in < 88.7229)
+    band_fin = band & torch.isfinite(torch_output_tensor)
+    rtol = 1e-5 if torch_dtype == torch.float32 else 2**-7
+    assert torch.allclose(output_tensor[band_fin].double(), torch_output_tensor[band_fin].double(), rtol=rtol, atol=0)
+    band_inf = band & torch.isinf(torch_output_tensor)
+    assert (output_tensor[band_inf].double() <= alpha * 3.4e38).all()
+
+    inf_out = torch.isinf(torch_output_tensor) & ~band
+    assert torch.equal(output_tensor[inf_out], torch_output_tensor[inf_out])
+    finite = ~nan_in & ~torch.isinf(torch_output_tensor) & ~band
+    assert_with_ulp(expected_result=torch_output_tensor[finite], actual_result=output_tensor[finite], ulp_threshold=2)
+
+
 @pytest.mark.parametrize("weight", [-0.5, 1.0, 0.5])
 @pytest.mark.parametrize("h", [64])
 @pytest.mark.parametrize("w", [128])

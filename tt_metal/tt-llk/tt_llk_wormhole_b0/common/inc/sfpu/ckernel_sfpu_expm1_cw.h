@@ -27,14 +27,23 @@ constexpr float CW_INV_LN2    = 1.4426950408889634f;
 constexpr float CW_NEG_LN2_HI = -0.6931152343750000f;
 constexpr float CW_NEG_LN2_LO = -3.19461832987e-05f;
 
-sfpi_inline sfpi::vFloat expm1_cw_clamped(sfpi::vFloat x)
+// POSITIVE_ARG (x >= 0): k <= 127 via tmp_cap; r keeps the unclamped x (about 1e-5 relative near ln(FLT_MAX))
+template <bool POSITIVE_ARG = false>
+sfpi_inline sfpi::vFloat expm1_cw_clamped(sfpi::vFloat x, sfpi::vFloat tmp_cap = sfpi::vFloat())
 {
-    // Clamp to prevent exponent underflow (k < -127 wraps setexp)
-    x = sfpi::max(x, -87.0f);
+    if constexpr (!POSITIVE_ARG)
+    {
+        // Clamp to prevent exponent underflow (k < -127 wraps setexp)
+        x = sfpi::max(x, -87.0f);
+    }
 
     // Cody-Waite range reduction: x = k*ln(2) + r
     const sfpi::vFloat c231 = Converter::as_float(0x4B400000U);
     sfpi::vFloat tmp        = x * CW_INV_LN2 + c231;
+    if constexpr (POSITIVE_ARG)
+    {
+        tmp = sfpi::min(tmp, tmp_cap);
+    }
     sfpi::vFloat k_f        = tmp - c231;
     sfpi::vFloat r          = k_f * CW_NEG_LN2_HI + x;
     r                       = r + k_f * CW_NEG_LN2_LO;
