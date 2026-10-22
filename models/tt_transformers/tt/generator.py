@@ -252,6 +252,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         self.trace_id_prefill_sampling = defaultdict(lambda: None)
         self.trace_input_prefill_sampling = defaultdict(lambda: None)
         self.trace_output_prefill_sampling = defaultdict(lambda: None)
+        self._prefill_sampling_compiled = set()
         self.trace_ids_decode = defaultdict(lambda: None)  # {device_sampling_bool: {device_id: trace_id}}
         self.trace_inputs_decode = defaultdict(lambda: None)
         self.trace_output_decode = defaultdict(lambda: None)
@@ -1674,6 +1675,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     )
 
                     if enable_trace_current_prompt and self._defer_prefill_recording:
+                        self._prefill_sampling_compiled.add(sampling_trace_key)
                         if sampling_input_key not in self._prepared_prefill_sampling_traces:
                             self._prepared_prefill_sampling_traces[
                                 sampling_input_key
@@ -1685,7 +1687,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                         tt_tokens, tt_log_probs = self.model[model_id].sampling.sample(
                             batched_logits, enable_trace=False
                         )
-                    elif enable_trace_current_prompt:
+                    elif enable_trace_current_prompt and self._should_trace_prefill_sampling(sampling_trace_key):
                         if self.trace_id_prefill_sampling[sampling_trace_key] is None:
                             (
                                 s_trace_id,
@@ -2360,6 +2362,15 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         if isinstance(enable_log_probs, (list, tuple)):
             return any(enable_log_probs)
         return bool(enable_log_probs)
+
+    def _should_trace_prefill_sampling(self, sampling_trace_key) -> bool:
+        """False on the first call of a variant warmup never compiled: it runs untraced, then is captured."""
+        if self.trace_id_prefill_sampling[sampling_trace_key] is not None:
+            return True
+        if sampling_trace_key in self._prefill_sampling_compiled:
+            return True
+        self._prefill_sampling_compiled.add(sampling_trace_key)
+        return False
 
     def _decode_trace_key(self, on_device_sampling, tokens):
         return on_device_sampling

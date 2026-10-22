@@ -12,6 +12,7 @@ stay in prefill order, so the readback reads by slot and writes by position. Pur
 index bookkeeping, no device execution.
 """
 
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -336,3 +337,15 @@ def test_resumed_layer_tables_retain_absolute_cached_page_positions():
     # 128 cached tokens plus a padded128-token suffix cover four absolute pages.
     result = prepare_prefill_page_tables_per_layer([table], [0], [0], 1, [200], [64], 128 + 128)[0]
     assert result.tolist() == [[10, 11, 12, 13]]
+
+
+def test_sampling_variant_warmup_did_not_run_is_compiled_before_capture():
+    """A sampling variant warmup never ran is compiled untraced first; capturing it first would load programs."""
+    generator = object.__new__(Generator)
+    generator.trace_id_prefill_sampling = defaultdict(lambda: None)
+    generator._prefill_sampling_compiled = set()
+    key = "sampling_128_0_32_1_False_True_False"
+    assert not generator._should_trace_prefill_sampling(key)
+    assert generator._should_trace_prefill_sampling(key)
+    generator.trace_id_prefill_sampling["sampling_128_0_1_1_False_False_True"] = 3
+    assert generator._should_trace_prefill_sampling("sampling_128_0_1_1_False_False_True")
