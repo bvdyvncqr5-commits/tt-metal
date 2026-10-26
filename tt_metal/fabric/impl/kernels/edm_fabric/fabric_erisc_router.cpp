@@ -2711,7 +2711,9 @@ void kernel_main() {
     init_stream_reg_if_used<to_sender_packets_completed_streams[1]>(0);
     // The first sender channel in the array is always for the transient/worker connection
     init_ptr_val<sender_channel_free_slots_stream_ids[0]>(SENDER_NUM_BUFFERS_ARRAY[0]);  // LOCAL WORKER
-    init_ptr_val<sender_channel_free_slots_stream_ids[1]>(SENDER_NUM_BUFFERS_ARRAY[1]);  // Compact index 0
+    if constexpr (NUM_SENDER_CHANNELS > 1) {
+        init_ptr_val<sender_channel_free_slots_stream_ids[1]>(SENDER_NUM_BUFFERS_ARRAY[1]);  // Compact index 0
+    }
 
     // Init retrain sync reg
     if (IS_RETRAIN_SYNC_MASTER()) {
