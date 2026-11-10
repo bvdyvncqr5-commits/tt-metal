@@ -22,6 +22,14 @@ struct matmul_mcast_1d_common_override_variables_t {
     ttnn::prim::Matmul1DType type{};
 };
 
+struct Mcast1DReadOptions {
+    bool in1_read_by_page = false;
+    bool in1_coalesced_read = false;
+    bool out_flush_per_block = false;
+    uint32_t in0_group = 1;
+    uint32_t in1_buffer_depth = 0;
+};
+
 struct MatmulMultiCoreReuseMcast1DProgramFactory {
     using shared_variables_t = matmul_mcast_1d_common_override_variables_t;
 
@@ -38,6 +46,12 @@ struct MatmulMultiCoreReuseMcast1DProgramFactory {
         const ttnn::prim::MatmulParams& operation_attributes,
         const ttnn::prim::MatmulInputs& tensor_args,
         std::vector<ttnn::Tensor>& tensor_return_value);
+
+    static ttnn::device_operation::ProgramArtifacts create_program_artifacts_with_read_options(
+        const ttnn::prim::MatmulParams& operation_attributes,
+        const ttnn::prim::MatmulInputs& tensor_args,
+        std::vector<ttnn::Tensor>& tensor_return_value,
+        const Mcast1DReadOptions& read_options);
 };
 
 struct MatmulMeshWorkloadMultiCoreReuseMcast1DProgramFactory {

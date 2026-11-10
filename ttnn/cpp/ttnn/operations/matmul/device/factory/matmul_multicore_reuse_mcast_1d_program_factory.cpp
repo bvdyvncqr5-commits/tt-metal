@@ -3248,7 +3248,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
     bool row_broadcast_bias = true,
     CoreCoord sub_device_start_core = {0, 0},
     const ttnn::PrefetcherPipeList& prefetcher_pipes = {},
-    ttsl::optional_reference<const McastIn0Sparsity> sparsity = std::nullopt) {
+    ttsl::optional_reference<const McastIn0Sparsity> sparsity = std::nullopt,
+    const Mcast1DReadOptions& read_options = {}) {
     using tt::tt_metal::num_cores_to_corerangeset_in_subcoregrids;
 
     // currently only support transpose of the full tile
@@ -3260,6 +3261,9 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
     // PrefetcherPipe delivery: a producer (the Tensor prefetcher, or any worker-sender pipe's) writes
     // each worker's in1 K-blocks straight into a PrefetcherPipe ring on that worker, and cb_in1 is a
     // relay laid over the rings, so in1 is neither read from DRAM nor multicast here.
+    if (read_options.in1_read_by_page && in1_is_sharded && in1_tensor.memory_config().is_dram()) {
+        in1_is_sharded = false;
+    }
     const bool use_prefetcher_pipes = !prefetcher_pipes.empty();
     if (use_prefetcher_pipes) {
         // This program never reads the weight, whatever its layout: in1 comes from the pipes, so none of
@@ -3335,6 +3339,11 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
     if (num_batches_scanned * num_blocks > 1) {
         in0_dfb_tiles *= operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
     }
+    uint32_t in0_group = read_options.in0_group;
+    if (in0_group < 1 || num_blocks % in0_group != 0 || use_sparsity || in0_is_sharded) {
+        in0_group = 1;
+    }
+    in0_dfb_tiles *= in0_group;
     uint32_t in0_dfb_size = in0_dfb_tiles * in0_aligned_tile_size;
 
     uint32_t in2_block_tiles = 0;
@@ -3351,7 +3360,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
     uint32_t in1_block_tiles = out_block_w * in0_block_w;
     uint32_t in1_dfb_tiles = in1_block_tiles;
     if ((use_sparsity ? num_batches_scanned : in1_B) * num_blocks > 1) {
-        in1_dfb_tiles *= operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+        in1_dfb_tiles *= read_options.in1_buffer_depth > 0 ? read_options.in1_buffer_depth
+                                                           : operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
     }
     if (in1_is_sharded) {
         uint32_t in1_shard_height_in_tiles = in1_tensor.shard_spec()->shape[0] / in1_tile.get_height();
@@ -3611,6 +3621,16 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
             in0_B * out_shard_tiles,
             std::numeric_limits<uint16_t>::max());
         mm_kernel_in1_sender_writer_defines["OUT_SHARDED"] = "1";
+    }
+
+    if (in0_group > 1) {
+        mm_kernel_in0_sender_writer_defines["IN0_BLOCK_GROUP"] = std::to_string(in0_group);
+    }
+    if (read_options.in1_coalesced_read && !in1_is_sharded) {
+        mm_kernel_in1_sender_writer_defines["IN1_COALESCED_READ"] = "1";
+    }
+    if (read_options.out_flush_per_block) {
+        mm_kernel_in1_sender_writer_defines["OUT_FLUSH_PER_BLOCK"] = "1";
     }
 
     // in1 is the reader of weights/output writer, and we choose to make it use the optimized reader noc
@@ -3962,16 +3982,17 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
             cta = {
                 {"in0_tensor_stride_w", static_cast<uint32_t>(in0_tensor_stride_w)},
                 {"in0_tensor_stride_h", static_cast<uint32_t>(in0_tensor_stride_h)},
-                {"in0_tensor_next_inner_dim_block_stride", static_cast<uint32_t>(in0_tensor_next_block_stride)},
+                {"in0_tensor_next_inner_dim_block_stride",
+                 static_cast<uint32_t>(in0_tensor_next_block_stride) * in0_group},
                 {"in0_tensor_next_h_dim_block_stride", static_cast<uint32_t>(in0_tensor_next_h_dim_block_stride)},
-                {"in0_block_w", in0_block_w},
+                {"in0_block_w", in0_block_w * in0_group},
                 {"in0_block_h", in0_block_h},
-                {"in0_block_num_tiles", in0_block_num_tiles},
+                {"in0_block_num_tiles", in0_block_num_tiles * in0_group},
                 {"in0_last_ktile_w", static_cast<uint32_t>(in0_last_ktile_w)},
                 {"in0_last_ktile_h", static_cast<uint32_t>(in0_last_ktile_h)},
                 {"shard_width_in_tiles", 0u},
                 {"shard_height_in_tiles", 0u},
-                {"num_blocks_inner_dim", num_blocks},
+                {"num_blocks_inner_dim", num_blocks / in0_group},
                 {"num_blocks_w_dim", out_num_blocks_x},
                 {"num_blocks_h_dim", out_num_blocks_y},
                 {"MtKt", M * K},
@@ -4045,8 +4066,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
                 },
             .compile_time_args =
                 {
-                    {"in0_block_num_tiles", in0_block_num_tiles},
-                    {"num_blocks_inner_dim", num_blocks},
+                    {"in0_block_num_tiles", in0_block_num_tiles * in0_group},
+                    {"num_blocks_inner_dim", num_blocks / in0_group},
                     {"num_blocks_w_dim", out_num_blocks_x},
                     {"num_blocks_h_dim", out_num_blocks_y},
                     {"batch", use_sparsity ? sparsity->num_batch_compute : in0_B},
@@ -6573,6 +6594,15 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
     const ttnn::prim::MatmulParams& operation_attributes,
     const ttnn::prim::MatmulInputs& tensor_args,
     std::vector<ttnn::Tensor>& tensor_return_value) {
+    return create_program_artifacts_with_read_options(operation_attributes, tensor_args, tensor_return_value, {});
+}
+
+ttnn::device_operation::ProgramArtifacts
+MatmulMultiCoreReuseMcast1DProgramFactory::create_program_artifacts_with_read_options(
+    const ttnn::prim::MatmulParams& operation_attributes,
+    const ttnn::prim::MatmulInputs& tensor_args,
+    std::vector<ttnn::Tensor>& tensor_return_value,
+    const Mcast1DReadOptions& read_options) {
     using namespace tt;
     using namespace operations::matmul::utilities;
 
@@ -6761,7 +6791,9 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast1DProgramFacto
             fused_op_signaler,
             fused_matmul_bias_row_broadcastable(bias),
             sub_device_start_core,
-            operation_attributes.prefetcher_pipes);
+            operation_attributes.prefetcher_pipes,
+            std::nullopt,
+            read_options);
     }
     return reuse_mcast_1d_optimized_helpers::create_program_mcast_in1_artifacts(
         a,

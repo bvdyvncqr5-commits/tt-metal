@@ -69,7 +69,11 @@ void kernel_main() {
 
         for (uint32_t bh = 0; bh < num_blocks_h_dim; ++bh) {
             for (uint32_t bw = 0; bw < num_blocks_w_dim; ++bw) {
+#ifdef IN0_RESIDENT
+                for (uint32_t block = 0; block < (bw == 0 ? num_blocks_inner_dim : 0u); ++block) {
+#else
                 for (uint32_t block = 0; block < num_blocks_inner_dim; ++block) {
+#endif
                     // Operand 0
                     dfb_in0.reserve_back(in0_block_num_tiles);
 

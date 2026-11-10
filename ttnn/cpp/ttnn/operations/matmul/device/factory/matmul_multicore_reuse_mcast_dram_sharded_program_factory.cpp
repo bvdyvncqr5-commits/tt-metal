@@ -7,7 +7,11 @@
 #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
 
 #include <algorithm>
+#include <array>
+#include <limits>
+#include <set>
 #include <utility>
+#include <vector>
 
 #include "hostdevcommon/common_values.hpp"
 #include <tt-metalium/tt_metal.hpp>
@@ -17,6 +21,7 @@
 #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
 #include <tt-metalium/math.hpp>
+#include <tt-metalium/experimental/device.hpp>
 #include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
 #include "ttnn/operations/compute_throttle_utils.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
@@ -97,7 +102,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     bool skip_compute,
     bool skip_in0_mcast,
     bool skip_write_back,
-    bool row_broadcast_bias) {
+    bool row_broadcast_bias,
+    const DramShardedReadOptions& read_options = {}) {
     using namespace tt;
 
     ttsl::optional_reference<const tt::tt_metal::MeshTensor> bias;
@@ -122,6 +128,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     const bool is_quasar = device.arch() == tt::ARCH::QUASAR;
 
     validate_num_workers_per_dram_bank(workers_per_bank);
+    const bool split_shard_unevenly = read_options.uneven_readers && workers_per_bank > 1 && !bias_tensor.has_value();
     TT_FATAL(
         workers_per_bank == 1 || device.arch() == tt::ARCH::BLACKHOLE,
         "Multiple workers per DRAM bank are currently supported only on Blackhole");
@@ -148,8 +155,51 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
                 {CoreCoord{bank % compute_with_storage_grid_size.x, bank / compute_with_storage_grid_size.x}, bank, 0});
         }
     } else {
-        reader_assignments =
-            get_dram_bank_reader_assignments(device, in1_noc, workers_per_bank, input_all_storage_cores);
+        if (read_options.round_robin_readers && workers_per_bank > 1) {
+            const auto coord = tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(device.shape().dims());
+            const auto first_readers = device.get_optimal_dram_bank_to_logical_worker_assignment(in1_noc, coord);
+            const uint32_t num_banks = first_readers.size();
+            std::vector<std::vector<CoreCoord>> bank_readers(num_banks);
+            std::set<CoreCoord> used;
+            for (const auto& [bank, core] : first_readers) {
+                TT_FATAL(bank < num_banks, "DRAM bank id {} out of range {}", bank, num_banks);
+                bank_readers[bank].push_back(core);
+                used.insert(core);
+            }
+            const auto grid = device.compute_with_storage_grid_size();
+            for (uint32_t k = 1; k < workers_per_bank; ++k) {
+                for (uint32_t bank = 0; bank < num_banks; ++bank) {
+                    uint32_t best = std::numeric_limits<uint32_t>::max();
+                    CoreCoord best_core{};
+                    for (uint32_t x = 0; x < grid.x; ++x) {
+                        for (uint32_t y = 0; y < grid.y; ++y) {
+                            const CoreCoord c{x, y};
+                            if (used.contains(c) || input_all_storage_cores.contains(c)) {
+                                continue;
+                            }
+                            const uint32_t d = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                                &device, coord, c, bank_readers[bank][0], in1_noc);
+                            if (d < best) {
+                                best = d;
+                                best_core = c;
+                            }
+                        }
+                    }
+                    TT_FATAL(
+                        best != std::numeric_limits<uint32_t>::max(), "No free reader {} for DRAM bank {}", k, bank);
+                    used.insert(best_core);
+                    bank_readers[bank].push_back(best_core);
+                }
+            }
+            for (uint32_t bank = 0; bank < num_banks; ++bank) {
+                for (uint32_t k = 0; k < workers_per_bank; ++k) {
+                    reader_assignments.push_back({bank_readers[bank][k], bank, k});
+                }
+            }
+        } else {
+            reader_assignments =
+                get_dram_bank_reader_assignments(device, in1_noc, workers_per_bank, input_all_storage_cores);
+        }
     }
     uint32_t num_dram_banks = reader_assignments.size() / workers_per_bank;
 
@@ -170,7 +220,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     }
 
     TT_FATAL(
-        in1_shard_width_tiles % workers_per_bank == 0,
+        split_shard_unevenly || in1_shard_width_tiles % workers_per_bank == 0,
         "DRAM-sharded matmul weight shard width {} tiles per bank must be divisible by workers_per_bank {}",
         in1_shard_width_tiles,
         workers_per_bank);
@@ -187,8 +237,30 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
 
     uint32_t per_core_N_compute = div_up(N, num_workers);
     uint32_t per_core_N_in1_sender = per_core_N_compute;
+    if (split_shard_unevenly) {
+        per_core_N_in1_sender = div_up(in1_shard_width_tiles, workers_per_bank);
+        per_core_N_compute = per_core_N_in1_sender;
+        const uint32_t uneven_rows = in1_tensor.shard_spec()->shape[0] / in1_tile.get_tile_shape()[0];
+        TT_FATAL(uneven_rows >= K, "Uneven DRAM readers: weight shard holds {} tile rows, K is {}", uneven_rows, K);
+        for (uint32_t uneven_k = 0; uneven_k < workers_per_bank; ++uneven_k) {
+            const uint32_t uneven_o = uneven_k * per_core_N_in1_sender;
+            const uint32_t uneven_rw = uneven_o < in1_shard_width_tiles
+                                           ? std::min(per_core_N_in1_sender, in1_shard_width_tiles - uneven_o)
+                                           : 0u;
+            TT_FATAL(
+                uneven_o + uneven_rw <= in1_shard_width_tiles &&
+                    (K - 1) * in1_shard_width_tiles + uneven_o + uneven_rw <= uneven_rows * in1_shard_width_tiles,
+                "Uneven DRAM readers: reader {} would read past its bank shard (offset {} width {} of {} x {} tiles)",
+                uneven_k,
+                uneven_o,
+                uneven_rw,
+                uneven_rows,
+                in1_shard_width_tiles);
+        }
+    }
     TT_FATAL(
-        workers_per_bank == 1 || in1_shard_width_tiles == workers_per_bank * per_core_N_in1_sender,
+        split_shard_unevenly || workers_per_bank == 1 ||
+            in1_shard_width_tiles == workers_per_bank * per_core_N_in1_sender,
         "Multi-reader DRAM-sharded matmul requires weight shard width {} tiles to equal {} workers times {} reader "
         "tiles",
         in1_shard_width_tiles,
@@ -420,6 +492,9 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     }
     if (workers_per_bank > 1) {
         mm_kernel_in1_sender_writer_defines["SPLIT_DRAM_BANK"] = "1";
+        if (split_shard_unevenly) {
+            mm_kernel_in1_sender_writer_defines["IN1_UNEVEN_READERS"] = "1";
+        }
     }
     if (fused_activation.has_value()) {
         if (fused_activation.value().op_type == UnaryOpType::RELU) {
@@ -435,6 +510,10 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
         mm_kernel_defines["FP32_DEST_ACC_EN"] = "1";
     }
     mm_kernel_in1_sender_writer_defines["OUT_SHARDED"] = "1";
+    if (read_options.streamed_write_back) {
+        TT_FATAL(per_core_M == 1 && out_subblock_h == 1, "Streamed write-back needs one output tile row per core");
+        mm_kernel_in1_sender_writer_defines["OUTPUT_STREAMED_WRITE_BACK"] = "1";
+    }
     mm_kernel_in1_sender_writer_defines["SKIP_MCAST"] = "1";
 
     if (skip_compute) {
@@ -746,6 +825,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     constexpr std::size_t num_shards_to_write_back_arg_index = 6;
     constexpr std::size_t fixed_writer_arg_count = 11;
     constexpr std::size_t writer_varargs_begin = 8;
+    std::vector<uint32_t> reader_vcs;
     for (uint32_t i = 0; i < all_worker_cores_ordered.size(); ++i) {
         auto core = all_worker_cores_ordered[i];
         const auto& reader_assignment = reader_assignments[i];
@@ -767,11 +847,64 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
                 break;
             }
         }
+        if (read_options.reader_vc == DramShardedReadOptions::ReaderVc::BankPlusReader) {
+            vc = (bank_id + reader_assignment.worker_index) & 0x3;
+        } else if (read_options.reader_vc == DramShardedReadOptions::ReaderVc::LeastUsedInRow) {
+            std::array<uint32_t, 4> vc_use = {0, 0, 0, 0};
+            for (uint32_t j = 0; j < i; ++j) {
+                if (all_worker_cores_ordered[j].y == core.y) {
+                    ++vc_use[reader_vcs[j]];
+                }
+            }
+            vc = bank_id & 0x3;
+            for (uint32_t k = 1; k < 4; ++k) {
+                const uint32_t candidate = (bank_id + k) & 0x3;
+                if (vc_use[candidate] < vc_use[vc]) {
+                    vc = candidate;
+                }
+            }
+        }
+        reader_vcs.push_back(vc);
         mm_in1_sender_writer_args.push_back((std::uint32_t)bank_id);
         mm_in1_sender_writer_args.push_back((std::uint32_t)vc);
         mm_in1_sender_writer_args.push_back(reader_assignment.worker_index);
 
-        if (per_core_N_in1_sender < per_core_N_storage) {
+        if (split_shard_unevenly) {
+            const uint32_t uneven_w = per_core_N_in1_sender;
+            const uint32_t uneven_off = reader_assignment.worker_index * uneven_w;
+            const uint32_t uneven_start = (i / workers_per_bank) * in1_shard_width_tiles + uneven_off;
+            uint32_t uneven_real =
+                uneven_off < in1_shard_width_tiles ? std::min(uneven_w, in1_shard_width_tiles - uneven_off) : 0u;
+            uneven_real = uneven_start < N ? std::min(uneven_real, N - uneven_start) : 0u;
+            std::vector<uint32_t> uneven_triples;
+            uint32_t uneven_col = uneven_start, uneven_left = uneven_real, uneven_first = 0, uneven_nsh = 0;
+            while (uneven_left > 0) {
+                const uint32_t uneven_sc = uneven_col / per_core_N_storage;
+                const uint32_t uneven_so = uneven_col % per_core_N_storage;
+                TT_FATAL(
+                    uneven_sc < num_cores_written_back,
+                    "Uneven DRAM readers: worker {} column {} has no storage core",
+                    core,
+                    uneven_col);
+                TT_FATAL(
+                    uneven_nsh == 0 || uneven_so == 0, "Uneven DRAM readers: only the first shard may start mid-core");
+                const uint32_t uneven_take = std::min(uneven_left, per_core_N_storage - uneven_so);
+                if (uneven_nsh == 0) {
+                    uneven_first = uneven_so;
+                }
+                uneven_triples.push_back(uneven_take * output_single_tile_size);
+                uneven_triples.push_back(output_noc_x[uneven_sc]);
+                uneven_triples.push_back(output_noc_y[uneven_sc]);
+                total_tensor_width_written_back += uneven_take;
+                uneven_col += uneven_take;
+                uneven_left -= uneven_take;
+                ++uneven_nsh;
+            }
+            mm_in1_sender_writer_args.push_back(uneven_nsh);
+            mm_in1_sender_writer_args.push_back(uneven_first * output_single_tile_size);
+            mm_in1_sender_writer_args.insert(
+                mm_in1_sender_writer_args.end(), uneven_triples.begin(), uneven_triples.end());
+        } else if (per_core_N_in1_sender < per_core_N_storage) {
             TT_FATAL(curr_storage_core_idx < num_cores_written_back, "Worker {} has no storage area assigned", core);
 
             uint32_t remaining_per_core_N_storage = (per_core_N_storage - per_core_N_storage_curr_stride);
@@ -1731,6 +1864,15 @@ MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory::create_program_artifacts
     const ttnn::prim::MatmulParams& operation_attributes,
     const ttnn::prim::MatmulInputs& tensor_args,
     std::vector<ttnn::Tensor>& tensor_return_value) {
+    return create_program_artifacts_with_read_options(operation_attributes, tensor_args, tensor_return_value, {});
+}
+
+ttnn::device_operation::ProgramArtifacts
+MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory::create_program_artifacts_with_read_options(
+    const ttnn::prim::MatmulParams& operation_attributes,
+    const ttnn::prim::MatmulInputs& tensor_args,
+    std::vector<ttnn::Tensor>& tensor_return_value,
+    const DramShardedReadOptions& read_options) {
     const auto& input_tensors = tensor_args.input_tensors;
     const auto& optional_input_tensors = tensor_args.optional_input_tensors;
     const auto& output_tensors = tensor_return_value;
@@ -1907,7 +2049,8 @@ MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory::create_program_artifacts
         skip_compute,
         skip_in0_mcast,
         skip_write_back,
-        row_broadcast_bias);
+        row_broadcast_bias,
+        read_options);
 }
 
 }  // namespace ttnn::prim

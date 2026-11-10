@@ -337,7 +337,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_in1_spe
     bool row_broadcast_bias = true,
     CoreCoord sub_device_start_core = {0, 0},
     uint32_t in0_row_tiles = 0,
-    uint32_t in0_column_offset_tiles = 0) {
+    uint32_t in0_column_offset_tiles = 0,
+    const Mcast2DReadOptions& read_options = {}) {
     using namespace tt;
 
     using tt::tt_metal::TensorMemoryLayout;
@@ -414,15 +415,25 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_in1_spe
     uint32_t out_num_blocks_x = in1_num_blocks_x;
     uint32_t out_num_blocks_y = in0_num_blocks_y;
 
+    const uint32_t buffer_depth = read_options.buffer_depth > 0
+                                      ? read_options.buffer_depth
+                                      : operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+    const bool in0_resident = read_options.in0_resident;
     uint32_t in0_block_tiles = out_block_h * in0_block_w;
     uint32_t in0_num_entries = in0_block_tiles;
     if (B * num_blocks > 1) {
-        in0_num_entries *= operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+        in0_num_entries *= buffer_depth;
+    }
+    if (in0_resident) {
+        TT_FATAL(
+            B == 1 && in0_num_blocks_y == 1 && !bias_mesh.has_value(),
+            "Resident in0 needs one batch, one output block row, no bias");
+        in0_num_entries = in0_block_tiles * num_blocks;
     }
     uint32_t in1_block_tiles = out_block_w * in0_block_w;
     uint32_t in1_num_entries = in1_block_tiles;
     if (B * num_blocks > 1) {
-        in1_num_entries *= operations::matmul::utilities::MCAST_INPUT_BUFFERING_DEPTH;
+        in1_num_entries *= buffer_depth;
     }
 
     uint32_t out_block_tiles = out_block_h * out_block_w;
@@ -682,17 +693,32 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_in1_spe
     if (in0_height_sharded) {
         mm_kernel_in0_sender_interleaved_defines["IN0_SHARDED"] = "1";
     }
+    std::map<std::string, std::string> mm_kernel_in0_receiver_defines;
+    if (in0_resident) {
+        mm_kernel_in0_sender_interleaved_defines["IN0_RESIDENT"] = "1";
+        mm_kernel_defines["IN0_RESIDENT"] = "1";
+        mm_kernel_in0_receiver_defines["IN0_RESIDENT"] = "1";
+    }
 
     if (in1_is_sharded) {
         if (in1_is_dram) {
             if (in1_is_width_sharded) {
                 mm_kernel_in1_sender_writer_defines["IN1_DRAM_WIDTH_SHARDED"] = "1";
+                if (read_options.coalesced_read) {
+                    mm_kernel_in1_sender_writer_defines["IN1_COALESCED_READ"] = "1";
+                }
+                if (read_options.in1_dram_sharded_per_n_block) {
+                    mm_kernel_in1_sender_writer_defines["IN1_DRAM_SHARDED_PER_N_BLOCK"] = "1";
+                }
             } else {
                 mm_kernel_in1_sender_writer_defines["IN1_DRAM_HEIGHT_SHARDED"] = "1";
             }
         } else {
             mm_kernel_in1_sender_writer_defines["IN1_SHARDED"] = "1";
         }
+    }
+    if (read_options.out_flush_per_block) {
+        mm_kernel_in1_sender_writer_defines["OUT_FLUSH_PER_BLOCK"] = "1";
     }
 
     if (output_is_sharded) {
@@ -1422,6 +1448,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_in1_spe
             .source =
                 "ttnn/cpp/ttnn/operations/matmul/device/kernels/dataflow/"
                 "reader_bmm_tile_layout_in0_receiver_metal2.cpp",
+            .compiler_options = {.defines = KernelSpec::CompilerOptions::Defines(mm_kernel_in0_receiver_defines)},
             .dfb_bindings =
                 {
                     DFBBinding{
@@ -1753,6 +1780,15 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast2DProgramFacto
     const ttnn::prim::MatmulParams& operation_attributes,
     const ttnn::prim::MatmulInputs& tensor_args,
     std::vector<ttnn::Tensor>& tensor_return_value) {
+    return create_program_artifacts_with_read_options(operation_attributes, tensor_args, tensor_return_value, {});
+}
+
+ttnn::device_operation::ProgramArtifacts
+MatmulMultiCoreReuseMcast2DProgramFactory::create_program_artifacts_with_read_options(
+    const ttnn::prim::MatmulParams& operation_attributes,
+    const ttnn::prim::MatmulInputs& tensor_args,
+    std::vector<ttnn::Tensor>& tensor_return_value,
+    const Mcast2DReadOptions& read_options) {
     using namespace tt;
     using namespace operations::matmul::utilities;
 
@@ -1894,7 +1930,8 @@ ttnn::device_operation::ProgramArtifacts MatmulMultiCoreReuseMcast2DProgramFacto
         fused_matmul_bias_row_broadcastable(bias),
         sub_device_start_core,
         in0_row_tiles,
-        in0_column_offset_tiles);
+        in0_column_offset_tiles,
+        read_options);
 }
 
 }  // namespace ttnn::prim

@@ -11,6 +11,10 @@
 #include <tt-metalium/hal.hpp>
 #include "ttnn/tensor/tensor_ops.hpp"
 #include "ttnn/operations/common/hash_without_rows.hpp"
+#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+
+#include <array>
+#include <optional>
 
 using namespace tt::constants;
 using namespace tt::tt_metal;
@@ -446,6 +450,98 @@ MinimalMatmulDeviceOperation::tensor_return_value_t MinimalMatmulDeviceOperation
 
 namespace ttnn::prim {
 
+namespace {
+
+struct BlackholeSubblockRow {
+    uint32_t M, K, N;
+    tt::tt_metal::DataType in0_dtype, in1_dtype, out_dtype;
+    uint32_t grid_x, grid_y;
+    uint32_t M_block_size, K_block_size, N_block_size;
+    tt::tt_metal::MathFidelity math_fidelity;
+    bool fp32_dest_acc_en;
+    uint32_t subblock_h, subblock_w;
+};
+
+std::optional<const experimental::prim::MinimalMatmulConfig> blackhole_config(
+    const Tensor& input_tensor,
+    const Tensor& weight_tensor,
+    const std::optional<Tensor>& bias_tensor,
+    const std::optional<operations::unary::UnaryWithParam>& fused_activation,
+    const std::optional<const experimental::prim::MinimalMatmulConfig>& config,
+    tt::tt_metal::DataType out_dtype,
+    const DeviceComputeKernelConfig& kernel_config,
+    int32_t chunks,
+    bool use_fused_ternary,
+    bool fuse_swiglu,
+    bool two_input_split) {
+    using tt::tt_metal::DataType;
+    using tt::tt_metal::MathFidelity;
+    static const std::array<BlackholeSubblockRow, 2> rows = {{
+        {1024,
+         4096,
+         6144,
+         DataType::BFLOAT16,
+         DataType::BFLOAT8_B,
+         DataType::BFLOAT16,
+         8,
+         10,
+         8,
+         8,
+         8,
+         MathFidelity::HiFi2,
+         true,
+         4,
+         1},
+        {1024,
+         14336,
+         4096,
+         DataType::BFLOAT8_B,
+         DataType::BFLOAT8_B,
+         DataType::BFLOAT8_B,
+         8,
+         8,
+         8,
+         8,
+         8,
+         MathFidelity::HiFi2,
+         false,
+         1,
+         8},
+    }};
+    auto* device = input_tensor.device();
+    if (!config.has_value() || device->arch() != tt::ARCH::BLACKHOLE ||
+        device->compute_with_storage_grid_size().x != 11 || device->compute_with_storage_grid_size().y != 10 ||
+        device->num_dram_channels() != 7 || bias_tensor.has_value() || fused_activation.has_value() || fuse_swiglu ||
+        chunks != 1 || use_fused_ternary || two_input_split) {
+        return config;
+    }
+    const auto& cfg = config.value();
+    if (cfg.subblock_h != 1 || cfg.subblock_w != 1) {
+        return config;
+    }
+    const uint32_t K = input_tensor.padded_shape()[-1];
+    const uint32_t M = input_tensor.physical_volume() / K;
+    const uint32_t N = weight_tensor.padded_shape()[-1];
+    auto [math_fidelity, math_approx_mode, fp32_dest_acc_en, packer_l1_acc, dst_full_sync_en] =
+        get_compute_kernel_config_args(device->arch(), kernel_config);
+    for (const auto& r : rows) {
+        if (r.M == M && r.K == K && r.N == N && r.in0_dtype == input_tensor.dtype() &&
+            r.in1_dtype == weight_tensor.dtype() && r.out_dtype == out_dtype &&
+            r.grid_x == cfg.compute_with_storage_grid_size.x && r.grid_y == cfg.compute_with_storage_grid_size.y &&
+            r.M_block_size == cfg.M_block_size && r.K_block_size == cfg.K_block_size &&
+            r.N_block_size == cfg.N_block_size && r.math_fidelity == math_fidelity &&
+            r.fp32_dest_acc_en == fp32_dest_acc_en) {
+            auto routed = cfg;
+            routed.subblock_h = r.subblock_h;
+            routed.subblock_w = r.subblock_w;
+            return routed;
+        }
+    }
+    return config;
+}
+
+}  // namespace
+
 std::vector<Tensor> minimal_matmul(
     const Tensor& input_tensor,
     const Tensor& weight_tensor,
@@ -475,7 +571,18 @@ std::vector<Tensor> minimal_matmul(
 
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
-            .config = config,
+            .config = blackhole_config(
+                input_tensor,
+                weight_tensor,
+                bias_tensor,
+                fused_activation,
+                config,
+                dtype.value_or(input_tensor.dtype()),
+                kernel_config_val,
+                chunks,
+                fused_ternary_input_a.has_value() && fused_ternary_input_b.has_value(),
+                fuse_swiglu,
+                optional_input_tensor.has_value()),
             .fused_activation = std::move(fused_activation),
             .output_mem_config = memory_config,
             .output_dtype = dtype,

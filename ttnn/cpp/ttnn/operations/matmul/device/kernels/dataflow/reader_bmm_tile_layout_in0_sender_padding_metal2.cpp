@@ -271,7 +271,11 @@ void kernel_main() {
                         in0_tensor_current_h_dim_block_start_addr;
 #endif  // IN0_SHARDED
                     uint32_t in0_tensor_current_inner_dim_block_start_tile_id = in0_tensor_current_h_dim_block_tile_id;
+#ifdef IN0_RESIDENT
+                    for (uint32_t block = 0; block < (bw == 0 ? num_blocks_inner_dim : 0u); ++block) {
+#else
                     for (uint32_t block = 0; block < num_blocks_inner_dim; ++block) {
+#endif
 #ifdef FUSE_OP
                         fused_op_receiver.update_current_block_start_tile_id(
                             block, in0_tensor_current_inner_dim_block_start_tile_id, in0_tensor_start_tile_id);
@@ -292,6 +296,12 @@ void kernel_main() {
                         for (uint32_t h = 0; h < in0_block_h; ++h) {
                             uint32_t in0_tensor_tile_id = in0_tensor_row_start_tile_id;
                             for (uint32_t w = 0; w < in0_block_w; ++w) {
+#ifdef IN0_BLOCK_GROUP
+                                in0_write_offset = (((w / (in0_block_w / IN0_BLOCK_GROUP)) * in0_block_h + h) *
+                                                        (in0_block_w / IN0_BLOCK_GROUP) +
+                                                    (w % (in0_block_w / IN0_BLOCK_GROUP))) *
+                                                   in0_aligned_tile_size_bytes;
+#endif
                                 if (bh < num_blocks_h_dim - 1 || h < last_block_h) {
                                     noc.async_read(
                                         s0,

@@ -2735,17 +2735,23 @@ bool get_broadcast_batch(
 }  // namespace
 
 MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& /*tensor_args*/) {
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const auto& config = operation_attributes.program_config.value();
 
     return std::visit(
-        [&operation_attributes](const auto& c) -> program_factory_t {
+        [&operation_attributes, &tensor_args](const auto& c) -> program_factory_t {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreProgramConfig>) {
                 return MatmulMultiCoreProgramFactory{};
             } else if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseProgramConfig>) {
                 return MatmulMultiCoreReuseOptimizedProgramFactory{};
             } else if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastProgramConfig>) {
+                if (bh_matmul_route(operation_attributes, tensor_args).has_value()) {
+                    return MatmulBhMcast1DProgramFactory{};
+                }
+                if (bh_matmul_route_2d(operation_attributes, tensor_args).has_value()) {
+                    return MatmulBhMcast2DProgramFactory{};
+                }
                 return MatmulMultiCoreReuseMcast2DProgramFactory{};
             } else if constexpr (std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCast1DProgramConfig>) {
                 // PrefetcherPipe delivery is the Metal 2.0 factory's, for both mcast_in0 and gather_in0:
@@ -2763,6 +2769,9 @@ MatmulDeviceOperation::program_factory_t MatmulDeviceOperation::select_program_f
             } else if constexpr (std::is_same_v<
                                      T,
                                      operations::matmul::MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig>) {
+                if (bh_matmul_route_dram_sharded(operation_attributes, tensor_args).has_value()) {
+                    return MatmulBhDramShardedProgramFactory{};
+                }
                 return MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory{};
             } else if constexpr (
                 std::is_same_v<T, operations::matmul::MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig>) {

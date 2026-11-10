@@ -82,6 +82,11 @@ void kernel_main() {
     constexpr uint32_t k_rows_per_block = in1_block_num_tiles / tiles_per_k_row;
     constexpr uint32_t in1_tile_size_bytes = in1_block_size_bytes / in1_block_num_tiles;
     const uint32_t shard_column_offset_tiles = dram_reader_index * tiles_per_k_row;
+#ifdef IN1_UNEVEN_READERS
+    const uint32_t uneven_left =
+        shard_column_offset_tiles < bank_row_stride_tiles ? bank_row_stride_tiles - shard_column_offset_tiles : 0;
+    const uint32_t uneven_row_tiles = uneven_left < tiles_per_k_row ? uneven_left : tiles_per_k_row;
+#endif
 #endif
 
     const Noc noc;
@@ -141,7 +146,11 @@ void kernel_main() {
         for (uint32_t row = 0; row < k_rows_per_block; ++row) {
             const uint32_t source_tile =
                 (block * k_rows_per_block + row) * bank_row_stride_tiles + shard_column_offset_tiles;
+#ifdef IN1_UNEVEN_READERS
+            const uint32_t read_size = uneven_row_tiles * in1_tile_size_bytes;
+#else
             const uint32_t read_size = tiles_per_k_row * in1_tile_size_bytes;
+#endif
             const uint32_t read_offset = source_tile * in1_tile_size_bytes;
             // A split reader's row may exceed one NoC burst (e.g. the LM
             // head). Use its real compile-time bound so the read helper
@@ -153,7 +162,11 @@ void kernel_main() {
                 {.bank_id = dram_bank_id, .offset_bytes = read_offset},
                 {},
                 NocOptVals{.vc = vc, .trid = curr_block_trid});
+#ifdef IN1_UNEVEN_READERS
+            l1_write_addr_in1 += tiles_per_k_row * in1_tile_size_bytes;
+#else
             l1_write_addr_in1 += read_size;
+#endif
         }
 #else
         for (uint32_t h = 0; h < in1_num_pages; ++h) {
@@ -224,7 +237,9 @@ void kernel_main() {
 #endif
 
     // WRITER
+#if !defined(OUTPUT_STREAMED_WRITE_BACK) || defined(SKIP_WRITE_BACK)
     dfb_out.wait_front(out_block_num_tiles);
+#endif
 
 #ifndef SKIP_WRITE_BACK
     uint32_t index_offset = 0;
@@ -243,6 +258,13 @@ void kernel_main() {
 
         // This shard's triple out of the write-back block.
         const uint32_t per_core_N_reshard_bytes = get_vararg(index_offset);
+#ifdef OUTPUT_STREAMED_WRITE_BACK
+        {
+            const uint32_t tiles_ready =
+                (l1_read_addr_out_offset + per_core_N_reshard_bytes + out_tile_bytes - 1) / out_tile_bytes;
+            dfb_out.wait_front(tiles_ready < out_block_num_tiles ? tiles_ready : out_block_num_tiles);
+        }
+#endif
         const uint32_t in0_mcast_sender_noc_x = get_vararg(index_offset + 1);
         const uint32_t in0_mcast_sender_noc_y = get_vararg(index_offset + 2);
 
@@ -299,6 +321,9 @@ void kernel_main() {
     noc.async_write_barrier();
 #endif
 
+#if defined(OUTPUT_STREAMED_WRITE_BACK) && !defined(SKIP_WRITE_BACK)
+    dfb_out.wait_front(out_block_num_tiles);
+#endif
     dfb_out.pop_front(out_block_num_tiles);
 
 #ifdef ARCH_QUASAR

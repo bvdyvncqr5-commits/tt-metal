@@ -426,6 +426,48 @@ void kernel_main() {
                         // its remote-CB credit to the prefetcher.
                         dfb_in1.reserve_back(in1_block_num_tiles);
                         experimental::remote_cb_wait_front(remote_cb_id, block == 0 ? 1u : 2u);
+#elif defined(IN1_DRAM_WIDTH_SHARDED) && defined(IN1_DRAM_SHARDED_PER_N_BLOCK)
+                        dfb_in1.reserve_back(in1_block_num_tiles);
+                        in1_start_address = dfb_in1.get_write_ptr();
+                        {
+                            const BankView n_block_bank(s1);
+                            const uint32_t block_col_begin = bw * in1_block_w;
+                            const uint32_t block_col_end = block_col_begin + in1_block_w;
+                            uint32_t shard_col_begin = 0;
+                            uint32_t vararg_index = 0;
+                            for (uint32_t i = 0; i < num_dram_shards_to_read; ++i) {
+                                const uint32_t n_block_bank_id = get_vararg(vararg_index + 1);
+                                const uint32_t shard_cols = get_vararg(vararg_index) / in1_single_tile_size_bytes;
+                                const uint32_t read_col_begin =
+                                    shard_col_begin > block_col_begin ? shard_col_begin : block_col_begin;
+                                const uint32_t read_col_end = (shard_col_begin + shard_cols) < block_col_end
+                                                                  ? (shard_col_begin + shard_cols)
+                                                                  : block_col_end;
+                                if (read_col_begin < read_col_end) {
+                                    const uint32_t shard_offset =
+                                        (i == 0 ? dram_tensor_start_offset : 0) +
+                                        (read_col_begin - shard_col_begin) * in1_single_tile_size_bytes;
+                                    uint32_t read_offset = l1_read_addr_in1_offset;
+                                    uint32_t write_addr =
+                                        static_cast<uint32_t>(in1_start_address) +
+                                        (read_col_begin - block_col_begin) * in1_single_tile_size_bytes;
+                                    for (uint32_t m = 0; m < in1_block_h; ++m) {
+                                        noc.async_read(
+                                            n_block_bank,
+                                            CoreLocalMem<uint32_t>(write_addr),
+                                            (read_col_end - read_col_begin) * in1_single_tile_size_bytes,
+                                            {.bank_id = n_block_bank_id, .offset_bytes = shard_offset + read_offset},
+                                            {});
+                                        read_offset += in1_block_w_dram_bytes;
+                                        write_addr += in1_block_w_bytes;
+                                    }
+                                }
+                                shard_col_begin += shard_cols;
+                                vararg_index += 2;
+                            }
+                        }
+                        l1_read_addr_in1_offset += in1_dram_block_size_bytes;
+                        noc.async_read_barrier();
 #elif defined(IN1_DRAM_WIDTH_SHARDED)
                         // Operand 1 - DRAM width sharded
                         dfb_in1.reserve_back(in1_block_num_tiles);
@@ -457,6 +499,15 @@ void kernel_main() {
                             for (uint32_t m = 0; m < in1_block_h; ++m) {
                                 uint32_t l1_read_addr_in1_temp = l1_read_addr_in1;
                                 uint32_t l1_write_addr_in1_temp = l1_write_addr_in1;
+#ifdef IN1_COALESCED_READ
+                                noc.async_read(
+                                    dram_bank,
+                                    CoreLocalMem<uint32_t>(l1_write_addr_in1_temp),
+                                    in1_block_w_dram * in1_single_tile_size_bytes,
+                                    {.bank_id = shard_bank_id,
+                                     .offset_bytes = shard_base_offset + l1_read_addr_in1_temp},
+                                    {});
+#else
                                 for (uint32_t w = 0; w < in1_block_w_dram; ++w) {
                                     noc.async_read_with_state<NocOptions::CUSTOM_VC, NOC_MAX_BURST_SIZE>(
                                         dram_bank,
@@ -469,6 +520,7 @@ void kernel_main() {
                                     l1_read_addr_in1_temp += in1_single_tile_size_bytes;
                                     l1_write_addr_in1_temp += in1_single_tile_size_bytes;
                                 }
+#endif
                                 l1_read_addr_in1 += in1_block_w_dram_bytes;
                                 l1_write_addr_in1 += in1_block_w_bytes;
                             }
@@ -518,6 +570,44 @@ void kernel_main() {
                             dfb_in1.get_write_ptr();  // copy start address of block, to be used for mcasting
 
                         // Copy in1 block into the buffer, as the default kernel
+#ifdef IN1_COALESCED_READ
+                        uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_inner_dim_block_start_tile_id;
+                        uint32_t in1_write_offset = 0;
+                        {
+                            const uint32_t run_write_base = dfb_in1.get_write_ptr();
+                            uint64_t run_src = 0;
+                            uint32_t run_dst = 0, run_len = 0;
+                            for (uint32_t h = 0; h < in1_block_h; ++h) {
+                                uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
+                                for (uint32_t w = 0; w < in1_block_w; ++w) {
+                                    if (bw < num_blocks_w_dim - 1 || w < last_block_w) {
+                                        const uint64_t a = s1.get_noc_addr(in1_tensor_tile_id);
+                                        const uint32_t d = run_write_base + in1_write_offset;
+                                        if (run_len != 0 && a == run_src + run_len && d == run_dst + run_len) {
+                                            run_len += in1_single_tile_size_bytes;
+                                        } else {
+                                            if (run_len != 0) {
+                                                noc_async_read(run_src, run_dst, run_len);
+                                            }
+                                            run_src = a;
+                                            run_dst = d;
+                                            run_len = in1_single_tile_size_bytes;
+                                        }
+                                    } else if (run_len != 0) {
+                                        noc_async_read(run_src, run_dst, run_len);
+                                        run_len = 0;
+                                    }
+                                    in1_write_offset += in1_aligned_tile_size_bytes;
+                                    in1_tensor_tile_id += in1_tensor_stride_w;
+                                }
+                                in1_tensor_row_start_tile_id += in1_tensor_stride_h;
+                            }
+                            if (run_len != 0) {
+                                noc_async_read(run_src, run_dst, run_len);
+                            }
+                            noc_async_read_barrier();
+                        }
+#else
                         read_in1_block<
                             in1_block_h,
                             in1_block_w,
@@ -530,6 +620,7 @@ void kernel_main() {
                             static_cast<uint32_t>(in1_start_address),
                             in1_tensor_current_inner_dim_block_start_tile_id,
                             bw < num_blocks_w_dim - 1 ? in1_block_w : last_block_w);
+#endif
                         in1_tensor_current_inner_dim_block_start_tile_id += in1_tensor_next_block_stride;
 
                         // Barrier! make sure the reads are done
@@ -710,7 +801,11 @@ void kernel_main() {
                                 out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                             }
 
+#ifdef OUT_FLUSH_PER_BLOCK
+                            noc.async_writes_flushed();
+#else
                             noc.async_write_barrier();
+#endif
                             dfb_out.pop_front(out_subblock_tile_count);
                             out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
                         }

@@ -415,10 +415,19 @@ void kernel_main() {
                     }
 #endif
 
+#ifdef IN0_RESIDENT
+                    if (bw == 0) {
+                        in0_dfb.wait_front((block + 1) * in0_block_num_tiles);
+                    }
+                    in1_dfb.wait_front(in1_block_num_tiles);
+
+                    uint32_t in0_index_subblock_offset = block * in0_block_num_tiles;
+#else
                     in0_dfb.wait_front(in0_block_num_tiles);
                     in1_dfb.wait_front(in1_block_num_tiles);
 
                     uint32_t in0_index_subblock_offset = 0;
+#endif
                     for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
                         uint32_t in1_index_subblock_offset = 0;
                         for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
@@ -586,7 +595,13 @@ void kernel_main() {
                     }
 #endif
 
+#ifdef IN0_RESIDENT
+                    if (bw == num_blocks_w_dim - 1 && block == num_blocks_inner_dim - 1) {
+                        in0_dfb.pop_front(num_blocks_inner_dim * in0_block_num_tiles);
+                    }
+#else
                     in0_dfb.pop_front(in0_block_num_tiles);
+#endif
                     in1_dfb.pop_front(in1_block_num_tiles);
                 }
 

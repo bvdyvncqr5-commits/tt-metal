@@ -12,6 +12,7 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_dram_sharded_program_factory.hpp"
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_batched_hs_dram_sharded_program_factory.hpp"
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_optimized_program_factory.hpp"
+#include "ttnn/operations/matmul/device/factory/matmul_bh_route.hpp"
 
 namespace ttnn::prim {
 
@@ -28,7 +29,10 @@ struct MatmulDeviceOperation {
         MatmulMeshWorkloadMultiCoreReuseMcast1DProgramFactory,  // gather_in0 legacy path
         MatmulMultiCoreReuseMcast2DProgramFactory,
         MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory,
-        MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory>;
+        MatmulMultiCoreReuseBatchedHSDRAMShardedProgramFactory,
+        MatmulBhMcast1DProgramFactory,
+        MatmulBhMcast2DProgramFactory,
+        MatmulBhDramShardedProgramFactory>;
 
     static program_factory_t select_program_factory(
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
